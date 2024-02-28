@@ -13,7 +13,10 @@ RUN apt-get install -y build-essential libimagequant-dev
 
 # Install Python dependencies
 COPY requirements.txt ./
+RUN python -m venv venv
+RUN . venv/bin/activate
 RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install libimagequant
 
 # Install Pillow with imagequant enabled
 RUN pip install --upgrade Pillow --global-option="-C" --global-option="imagequant=enable" --no-binary :all:
