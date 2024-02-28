@@ -16,7 +16,6 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Install Pillow with imagequant enabled
-RUN CFLAGS="-I/usr/include" LDFLAGS="-L/usr/lib" python3 -m pip install imagequant==enable
 RUN pip install --upgrade Pillow --global-option="-C" --global-option="imagequant=enable" --no-binary :all:
 
 # Make port 80 available to the world outside this container
