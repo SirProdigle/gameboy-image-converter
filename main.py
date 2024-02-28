@@ -334,7 +334,7 @@ palette_color_1_string = gr.State(value="#000000")
 palette_color_2_string = gr.State(value="#000000")
 palette_color_3_string = gr.State(value="#000000")
 palette_color_4_string = gr.State(value="#000000")
-quantize_for_GBC = gr.State(True)
+quantize_for_GBC = gr.State(False)
 use_tile_variance = gr.State(False)
 
 
