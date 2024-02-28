@@ -621,4 +621,5 @@ if __name__ == "__main__":
     start_clearing_temporary_files_timer(interval)
     demo: gr.Blocks = create_gradio_interface()
     # use http basic auth with password of boobiess
-    demo.launch(share=False, server_name="0.0.0.0", server_port=7860)
+    header = "<script async defer data-website-id="f5b8324e-09b2-4d56-8c1f-40a1f1457023" src="https://metrics.prodigle.dev/umami.js"></script>"
+    demo.launch(share=False, server_name="0.0.0.0", server_port=7860, head=header)
