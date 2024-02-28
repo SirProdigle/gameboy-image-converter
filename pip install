@@ -1,2 +1,3 @@
+CFLAGS="-I/usr/include" LDFLAGS="-L/usr/lib" python3 -m pip install -C imagequant =enable
 pip uninstall Pillow && python -m pip cache purge && python3 -m pip install --upgrade Pillow  --global-option="-C" --global-option="imagequant=enable" --no-binary :all:
 
