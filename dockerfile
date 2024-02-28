@@ -13,15 +13,13 @@ RUN apt-get install -y build-essential libimagequant-dev libjpeg-dev zlib1g-dev 
 
 # Install Python dependencies
 COPY requirements.txt ./
-RUN python -m venv venv
-RUN . venv/bin/activate
 RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install libimagequant
 
 # Install Pillow with imagequant enabled
 RUN pip uninstall Pillow -y
 RUN python -m pip cache purge
-Run python3 -m pip install --upgrade Pillow  --global-option="-C" --global-option="imagequant=enable" --no-binary --no-cache-dir :all:
+Run python -m pip install --upgrade Pillow  --global-option="-C" --global-option="imagequant=enable" --no-cache-dir --no-binary :all:
 
 # Make port 80 available to the world outside this container
 # EXPOSE 80
