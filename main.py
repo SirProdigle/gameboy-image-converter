@@ -11,6 +11,7 @@ import os
 import zipfile
 import threading
 import time
+from sklearn.cluster import KMeans
 
 # Constants for dithering and quantization methods
 DITHER_METHODS = {
@@ -375,6 +376,8 @@ def create_gradio_interface():
                     number_of_colors = gr.Slider(label="Number of colors", minimum=2, maximum=256, step=1, value=4)
                 with gr.Group():
                     with gr.Row():
+                        limit_4_colors_per_tile = gr.Checkbox(label="Limit to 4 colors per tile, 8 palettes",
+                                                              value=False, visible=True)
                         reduce_tile_checkbox = gr.Checkbox(label="Reduce to 192 unique 8x8 tiles", value=False)
                         use_tile_variance_checkbox = gr.Checkbox(label="Sort by tile complexity", value=False)
                     reduce_tile_similarity_threshold = gr.Slider(label="Tile similarity threshold", minimum=0.3,
@@ -487,9 +490,66 @@ def create_gradio_interface():
         use_custom_palette.change(lambda x: gr.update('palette_image', visible=x),
                                   inputs=[use_custom_palette], outputs=[palette_image])
 
+        def extract_tiles(image, tile_size=(8, 8)):
+            """Extract 8x8 tiles from the image."""
+            tiles = []
+            for y in range(0, image.height, tile_size[1]):
+                for x in range(0, image.width, tile_size[0]):
+                    box = (x, y, x + tile_size[0], y + tile_size[1])
+                    tiles.append(image.crop(box))
+            return tiles
+
+        def generate_palette(tile, num_colors=4):
+            """Generate a 4-color palette for an 8x8 tile using K-means clustering."""
+            data = np.array(tile).reshape((-1, 3))
+            kmeans = KMeans(n_clusters=num_colors)
+            kmeans.fit(data)
+            palette = kmeans.cluster_centers_.astype(int)
+            return palette
+
+        def find_closest_palette(palette, palettes):
+            """Find the closest existing palette to the given one."""
+            min_distance = float('inf')
+            closest_palette = None
+            for existing_palette in palettes:
+                distance = np.linalg.norm(palette - existing_palette)
+                if distance < min_distance:
+                    min_distance = distance
+                    closest_palette = existing_palette
+            return closest_palette
+
+        def apply_palette(tile, palette):
+            """Apply a 4-color palette to an 8x8 tile."""
+            tile_data = np.array(tile)
+            reshaped_tile = tile_data.reshape((-1, 3))
+            new_tile_data = np.zeros_like(reshaped_tile)
+            for i, color in enumerate(palette):
+                distances = np.sqrt(np.sum((reshaped_tile - color) ** 2, axis=1))
+                closest_color_indices = distances == np.min(distances, axis=0)
+                new_tile_data[closest_color_indices] = color
+            return Image.fromarray(new_tile_data.reshape(tile_data.shape).astype('uint8'))
+
+        def process_tiles(tiles, max_palettes=8):
+            """Process the tiles to limit them to the best 4-color palettes."""
+            unique_palettes = []
+            tile_palettes = []
+            for tile in tiles:
+                palette = generate_palette(tile)
+                if not unique_palettes:
+                    unique_palettes.append(palette)
+                    tile_palettes.append(palette)
+                else:
+                    closest_palette = find_closest_palette(palette, unique_palettes)
+                    if closest_palette is None or len(unique_palettes) < max_palettes:
+                        unique_palettes.append(palette)
+                        tile_palettes.append(palette)
+                    else:
+                        tile_palettes.append(closest_palette)
+            return [apply_palette(tiles[i], tile_palettes[i]) for i in range(len(tiles))], unique_palettes
+
         def process_image(image, width, height, aspect_ratio, color_limit, num_colors, quant_method, dither_method,
                           use_palette, custom_palette, grayscale, black_and_white, bw_threshold, reduce_tile_flag,
-                          reduce_tile_threshold):
+                          reduce_tile_threshold, limit_4_colors_per_tile):
             text_for_palette = ""
             if image.mode != "RGB":
                 image = image.convert("RGB")
@@ -504,6 +564,20 @@ def create_gradio_interface():
                                                            quantize=QUANTIZATION_METHODS[quant_method_key],
                                                            dither=DITHER_METHODS[dither_method_key])
                 image_for_reference_palette: Image = image_for_reference_palette.convert('RGB')
+
+
+                if limit_4_colors_per_tile:
+                    tiles = extract_tiles(image_for_reference_palette)
+                    processed_tiles, _ = process_tiles(tiles)
+                    # Reconstruct the image from the processed tiles
+                    new_image = Image.new('RGB', image_for_reference_palette.size)
+                    tile_index = 0
+                    for y in range(0, image_for_reference_palette.height, 8):
+                        for x in range(0, image_for_reference_palette.width, 8):
+                            new_image.paste(processed_tiles[tile_index], (x, y))
+                            tile_index += 1
+                    image_for_reference_palette = new_image
+
                 palette_colors = image_for_reference_palette.getcolors(maxcolors=num_colors)
                 palette_colors = [color for count, color in palette_colors]
 
@@ -552,7 +626,7 @@ def create_gradio_interface():
 
         def process_image_folder(input_files, width, height, aspect_ratio, color_limit, num_colors, quant_method, dither_method,
                                  use_palette, custom_palette, grayscale, black_and_white, bw_threshold, reduce_tile_flag,
-                                    reduce_tile_threshold):
+                                    reduce_tile_threshold, limit_4_colors_per_tile):
             folder_name = "output_" + str(random.randint(0, 100000))
             while os.path.exists(folder_name):
                 folder_name = "output_" + str(random.randint(0, 100000))
@@ -567,7 +641,7 @@ def create_gradio_interface():
                     imageData = Image.open(file.name)
                     result = process_image(imageData, width, height, aspect_ratio, color_limit, num_colors, quant_method, dither_method,
                                            use_palette, custom_palette, grayscale, black_and_white, bw_threshold, reduce_tile_flag,
-                                           reduce_tile_threshold)
+                                           reduce_tile_threshold, limit_4_colors_per_tile)
                     result[0].save(os.path.join(folder_name, os.path.basename(input_files[index].name)))
                     text_for_palette.append(f"File {index + 1}: {os.path.basename(input_files[index].name)}\n{result[1]}")
                 # zip the folder
@@ -588,7 +662,7 @@ def create_gradio_interface():
                              inputs=[image_input, new_width, new_height, keep_aspect_ratio, enable_color_limit,
                                      number_of_colors, quantization_method, dither_method, use_custom_palette,
                                      palette_image, is_grayscale, is_black_and_white, black_and_white_threshold,
-                                     reduce_tile_checkbox, reduce_tile_similarity_threshold],
+                                     reduce_tile_checkbox, reduce_tile_similarity_threshold, limit_4_colors_per_tile],
                              outputs=[image_output, palette_text,
                                       image_output_no_palette, notice_text])
 
@@ -596,7 +670,7 @@ def create_gradio_interface():
                                     inputs=[folder_input, new_width, new_height, keep_aspect_ratio, enable_color_limit,
                                             number_of_colors, quantization_method, dither_method, use_custom_palette,
                                             palette_image, is_grayscale, is_black_and_white, black_and_white_threshold,
-                                            reduce_tile_checkbox, reduce_tile_similarity_threshold],
+                                            reduce_tile_checkbox, reduce_tile_similarity_threshold, limit_4_colors_per_tile],
                                     outputs=[image_output_zip, palette_text,
                                              image_output_no_palette, notice_text])
 
