@@ -240,9 +240,9 @@ def reduce_tiles(image, tile_size=8, max_unique_tiles=192, similarity_threshold=
 
             if len(unique_tiles) == max_unique_tiles:
                 remaining_tiles = len(tiles) - (x // tile_size + y // tile_size * (width // tile_size))
-                notice = (f"**OUT OF SPARE TILES**\n\n"
-                          f" Tiles left to process: {remaining_tiles}   \n\n"
-                          f"\n\nConsider reducing Tile Similarity Threshold")
+                notice = (f"**OUT OF SPARE TILES**\n"
+                          f"Tiles left to process: {remaining_tiles}   \n"
+                          f"Consider reducing Tile Similarity Threshold")
 
         else:
 
@@ -356,7 +356,8 @@ def adjust_for_aspect_ratio(keep_aspect, current_width, current_height):
 
 
 def create_gradio_interface():
-    with gr.Blocks() as demo:
+    header = '<script async defer data-website-id="f5b8324e-09b2-4d56-8c1f-40a1f1457023" src="https://metrics.prodigle.dev/umami.js"></script>'
+    with gr.Blocks(head=header) as demo:
         with gr.Row():
             with gr.Column():
                 with gr.Row():
@@ -372,7 +373,7 @@ def create_gradio_interface():
                 with gr.Row():
                     enable_color_limit = gr.Checkbox(label="Limit number of colors", value=True)
                     number_of_colors = gr.Slider(label="Number of colors", minimum=2, maximum=256, step=1, value=4)
-                with gr.Box():
+                with gr.Group():
                     with gr.Row():
                         reduce_tile_checkbox = gr.Checkbox(label="Reduce to 192 unique 8x8 tiles", value=False)
                         use_tile_variance_checkbox = gr.Checkbox(label="Sort by tile complexity", value=False)
@@ -383,7 +384,7 @@ def create_gradio_interface():
                                                       label="Quantization Method", value="libimagequant")
                     dither_method = gr.Dropdown(choices=list(DITHER_METHODS.keys()), label="Dither Method",
                                                 value="None")
-                with gr.Box():
+                with gr.Group():
                     use_custom_palette = gr.Checkbox(label="Use Custom Color Palette", value=True)
                     quantize_for_gbc_checkbox = gr.Checkbox(label="Quantize for Game Boy Color Palette Override",
                                                             value=False, visible=True)
@@ -394,6 +395,10 @@ def create_gradio_interface():
                     is_black_and_white = gr.Checkbox(label="Convert to Black and White", value=False)
                     black_and_white_threshold = gr.Slider(label="Black and White Threshold", minimum=0, maximum=255,
                                                           value=128, visible=False)
+
+
+                is_black_and_white.change(lambda x: gr.update('black_and_white_threshold', visible=x),
+                                          inputs=[is_black_and_white], outputs=[black_and_white_threshold])
 
                 # Logic to capture and display original image dimensions
                 def capture_original_dimensions(image):
@@ -454,37 +459,38 @@ def create_gradio_interface():
                 )
 
             with gr.Column():
-                with gr.Box():
+                with gr.Group():
                     with gr.Row():
                         with gr.Column():
                             image_output = gr.Image(type="pil", label="Output Image", height=300)
-                            notice_text = gr.Markdown(label="Warning Text")
                         with gr.Column():
                             image_output_no_palette = gr.Image(type="pil", label="Output Image (Natural Palette)",
-                                                               height=300)
-                            with gr.Row():
-                                color1 = gr.ColorPicker(value="#000000", label="")
-                                c1text = gr.Text(value="#000000", label="", interactive=False, visible=True)
-                                color2 = gr.ColorPicker(value="#000000", label="")
-                                c2text = gr.Text(value="#000000", label="", interactive=False, visible=True)
-                                color3 = gr.ColorPicker(value="#000000", label="")
-                                c3text = gr.Text(value="#000000", label="", interactive=False, visible=True)
-                                color4 = gr.ColorPicker(value="#000000", label="")
-                                c4text = gr.Text(value="#000000", label="", interactive=False, visible=True)
-                execute_button = gr.Button("Convert Image")
-                execute_button_folder = gr.Button("Convert Folder")
-                image_output_folder = gr.File(label="Output Folder", file_count='directory')
+                                          height=300)
+                    with gr.Row():
+                        with gr.Column():
+                            notice_text = gr.Text(value="No Warnings", lines=3, max_lines=3, autoscroll=False, interactive=False, label="Warnings", show_label=False)
+                        with gr.Column():
+                            kofi_html = gr.HTML(
+                                "<a href='https://ko-fi.com/prodigle' target='_blank'><img height='36' style='border:0px; margin:auto; padding: 5px; width: 100%' src='https://cdn.ko-fi.com/cdn/kofi1.png?v=2' border='0' alt='Buy Me a Coffee at ko-fi.com' /></a>")
+                    with gr.Row():
+                        with gr.Column():
+                            palette_text = gr.Textbox(label="Custom Palette Info", value="None", interactive=False,
+                                                  show_copy_button=True, lines=4, max_lines=4, autoscroll=False)
+                with gr.Row():
+                    execute_button = gr.Button("Convert Image")
+                    execute_button_folder = gr.Button("Convert Folder")
+                image_output_zip = gr.File(label="Output Folder Zip", type="filepath")
 
-        use_custom_palette.change(lambda x: palette_image.update(visible=x), inputs=[use_custom_palette],
-                                  outputs=[palette_image])
-        is_black_and_white.change(lambda x: black_and_white_threshold.update(visible=x), inputs=[is_black_and_white],
-                                  outputs=[black_and_white_threshold])
-        reduce_tile_checkbox.change(lambda x: reduce_tile_similarity_threshold.update(visible=x),
+        reduce_tile_checkbox.change(lambda x: gr.update('reduce_tile_checkbox', visible=x),
                                     inputs=[reduce_tile_checkbox], outputs=[reduce_tile_similarity_threshold])
+
+        use_custom_palette.change(lambda x: gr.update('palette_image', visible=x),
+                                  inputs=[use_custom_palette], outputs=[palette_image])
 
         def process_image(image, width, height, aspect_ratio, color_limit, num_colors, quant_method, dither_method,
                           use_palette, custom_palette, grayscale, black_and_white, bw_threshold, reduce_tile_flag,
                           reduce_tile_threshold):
+            text_for_palette = ""
             if image.mode != "RGB":
                 image = image.convert("RGB")
             image = downscale_image(image, int(width), int(height), aspect_ratio)
@@ -501,12 +507,9 @@ def create_gradio_interface():
                 palette_colors = image_for_reference_palette.getcolors(maxcolors=num_colors)
                 palette_colors = [color for count, color in palette_colors]
 
-                try:
-                    palette_color_values = [
-                        "#{0:02x}{1:02x}{2:02x}".format(*color) for color in palette_colors[:4]
-                    ]
-                except:
-                    palette_color_values = ["#000000"] * 4
+                palette_color_values = [
+                    "#{0:02x}{1:02x}{2:02x}".format(*color) for color in palette_colors
+                ]
 
                 if use_palette and custom_palette is not None:
                     if quantize_for_GBC and quantize_for_GBC.value == True:
@@ -530,11 +533,10 @@ def create_gradio_interface():
 
                 # Return all necessary components including the processed image and color values
                 # set pallete_color_values to exactly 4 values nomatter if there's less or more
-                while len(palette_color_values) < 4:
-                    palette_color_values.append("#000000")
+                for i in range(len(palette_color_values)):
+                    text_for_palette += f"Color {i + 1}: {palette_color_values[i]}\n"
 
-                return image, *palette_color_values, palette_color_values[0], palette_color_values[1], \
-                    palette_color_values[2], palette_color_values[3], image_for_reference_palette, notice
+                return image, text_for_palette, image_for_reference_palette, notice
 
             if grayscale:
                 image = convert_to_grayscale(image)
@@ -542,11 +544,9 @@ def create_gradio_interface():
                 image = convert_to_black_and_white(image, threshold=bw_threshold)
             if reduce_tile_flag:
                 image, _ = reduce_tiles(image, similarity_threshold=reduce_tile_threshold)
-
             return (
                 image,
-                0, 0, 0, 0,
-                'null', 'null', 'null', 'null', None,
+                text_for_palette, None,
                 None
             )
 
@@ -559,6 +559,7 @@ def create_gradio_interface():
             os.makedirs(folder_name)
             try:
                 fileListing = []
+                text_for_palette = []
                 for index, file in enumerate(input_files):
                     # if file is folder, skip
                     if os.path.isdir(file.name):
@@ -568,13 +569,16 @@ def create_gradio_interface():
                                            use_palette, custom_palette, grayscale, black_and_white, bw_threshold, reduce_tile_flag,
                                            reduce_tile_threshold)
                     result[0].save(os.path.join(folder_name, os.path.basename(input_files[index].name)))
+                    text_for_palette.append(f"File {index + 1}: {os.path.basename(input_files[index].name)}\n{result[1]}")
                 # zip the folder
                 with zipfile.ZipFile(os.path.join(folder_name, folder_name + ".zip"), 'w') as zipf:
                     for root, dirs, files in os.walk(folder_name):
                         for file in files:
                             if file != folder_name + ".zip":
                                 zipf.write(os.path.join(root, file), os.path.relpath(os.path.join(root, file), folder_name))
-                return os.path.join(os.getcwd(), folder_name, folder_name + ".zip"), None, None, None, None, None, None, None, None, None, None
+                    # add the palette text to the zip
+                    zipf.writestr("palette_info.txt", "\n\n".join(text_for_palette))
+                return os.path.join(os.getcwd(), folder_name, folder_name + ".zip"), "\n\n".join(text_for_palette), None, None
 
             except Exception as e:
                 os.system("rm -rf " + folder_name)
@@ -585,7 +589,7 @@ def create_gradio_interface():
                                      number_of_colors, quantization_method, dither_method, use_custom_palette,
                                      palette_image, is_grayscale, is_black_and_white, black_and_white_threshold,
                                      reduce_tile_checkbox, reduce_tile_similarity_threshold],
-                             outputs=[image_output, color1, color2, color3, color4, c1text, c2text, c3text, c4text,
+                             outputs=[image_output, palette_text,
                                       image_output_no_palette, notice_text])
 
         execute_button_folder.click(process_image_folder,
@@ -593,7 +597,7 @@ def create_gradio_interface():
                                             number_of_colors, quantization_method, dither_method, use_custom_palette,
                                             palette_image, is_grayscale, is_black_and_white, black_and_white_threshold,
                                             reduce_tile_checkbox, reduce_tile_similarity_threshold],
-                                    outputs=[image_output_folder, color1, color2, color3, color4, c1text, c2text, c3text, c4text,
+                                    outputs=[image_output_zip, palette_text,
                                              image_output_no_palette, notice_text])
 
     return demo
@@ -621,5 +625,4 @@ if __name__ == "__main__":
     start_clearing_temporary_files_timer(interval)
     demo: gr.Blocks = create_gradio_interface()
     # use http basic auth with password of boobiess
-    header = "<script async defer data-website-id="f5b8324e-09b2-4d56-8c1f-40a1f1457023" src="https://metrics.prodigle.dev/umami.js"></script>"
-    demo.launch(share=False, server_name="0.0.0.0", server_port=7860, head=header)
+    demo.launch(share=False, server_name="0.0.0.0", server_port=7860)
