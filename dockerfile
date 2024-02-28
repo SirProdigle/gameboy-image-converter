@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y git \
     && git clone https://github.com/SirProdigle/gameboy-image-converter.git .
 
 # Install dependencies for building Python packages and libimagequant
-RUN apt-get install -y build-essential libimagequant-dev
+RUN apt-get install -y build-essential libimagequant-dev zlib1g-dev libfreetype6-dev libjpeg62-turbo-dev libopenjp2-7-dev libtiff5-dev liblcms2-dev libwebp-dev
 
 # Install Python dependencies
 COPY requirements.txt ./
