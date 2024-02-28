@@ -1,0 +1,5 @@
+gradio==3.41 # Adjust to the latest version available
+Pillow==10.0  # Adjust to the latest version available
+libimagequant # Adjust to the latest version available
+scikit-image
+numpy
