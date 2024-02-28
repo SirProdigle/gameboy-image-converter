@@ -509,7 +509,7 @@ def create_gradio_interface():
                     palette_color_values = ["#000000"] * 4
 
                 if use_palette and custom_palette is not None:
-                    if quantize_for_GBC and quantize_for_gbc.value == True:
+                    if quantize_for_GBC and quantize_for_GBC.value == True:
                         image = limit_colors(image, limit=min(num_colors, len(custom_palette.getcolors())),
                                              quantize=QUANTIZATION_METHODS[quant_method_key],
                                              dither=DITHER_METHODS[dither_method_key])
