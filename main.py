@@ -755,14 +755,25 @@ def create_gradio_interface():
         from PIL import Image
 
         def analyze_and_construct_palettes(tiles, max_palettes=8, max_colors=32, local_influence=0.5):
-            num_clusters = 150
-            # Convert PIL Images to LAB
+            # Extract unique colors from all tiles
+            unique_colors_set = set()
+            for tile in tiles:
+                rgb_tile = np.array(tile.convert('RGB'), dtype=np.uint8)  # Convert each PIL Image tile to a NumPy array
+                unique_colors = set(tuple(color) for row in rgb_tile for color in row)
+                unique_colors_set.update(unique_colors)
+
+            # Determine the actual number of clusters based on unique colors in the image
+            num_unique_colors = len(unique_colors_set)
+            num_clusters = min(max_colors, num_unique_colors)  # Adjust number of clusters based on unique colors
+
+            # Convert PIL Images to LAB and perform clustering as before
             lab_tiles = [rgb2lab(np.array(tile.convert('RGB'), dtype=np.float64) / 255) for tile in tiles]
             all_tiles_lab = np.vstack([tile.reshape(-1, 3) for tile in lab_tiles])
 
-            # Perform global KMeans clustering
             global_kmeans = MiniBatchKMeans(n_clusters=num_clusters, random_state=42)
             global_kmeans.fit(all_tiles_lab)
+            # The rest of your function continues as before...
+
             broad_palette_lab = global_kmeans.cluster_centers_
 
             # Compute global color weights
