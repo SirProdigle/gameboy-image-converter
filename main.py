@@ -545,117 +545,296 @@ def create_gradio_interface():
             distribution = {tuple(color): count / total for color, count in zip(colors, counts)}
             return distribution
 
-        def find_best_matching_palette(tile_distribution, existing_palettes):
+        import numpy as np
+        from scipy.stats import wasserstein_distance
+
+        import numpy as np
+        from scipy.stats import wasserstein_distance
+        from sklearn.metrics import pairwise_distances
+
+        import numpy as np
+        from sklearn.metrics import pairwise_distances
+
+        def find_best_matching_palette(tile_distribution, existing_palettes, adjacent_distributions=None,
+                                       balance_factor=0.5, key_color_weight=1):
             """
-            Finds the existing palette that best matches the tile's color distribution.
-            This function assumes tile_distribution is a dict with color tuples as keys
-            and their normalized frequency as values.
+            Enhanced palette matching considering color distribution, adjacent tiles, balance between local and global harmony, and key colors.
+            Args:
+                tile_distribution (dict): Color distribution of the current tile.
+                existing_palettes (list): List of available palettes to choose from.
+                adjacent_distributions (list): List of color distributions from adjacent tiles.
+                balance_factor (float): Balances between matching the tile's own colors and blending with adjacent tiles.
+                key_color_weight (float): Additional weight given to key colors to ensure their presence in the selected palette.
+            Returns:
+                int: Index of the best matching palette.
             """
-            best_score = float('inf')  # Lower scores are better; initialize with infinity
-            best_palette = None
-            for palette in existing_palettes:
-                score = 0
+            best_score = float('inf')
+            best_palette_index = None
+            # Define key colors that need special attention (e.g., white, black, skin tones)
+            key_colors = [(255, 255, 255), (0, 0, 0)]  # White and black
+
+            # Iterate through each candidate palette
+            for palette_index, palette in enumerate(existing_palettes):
+                palette_colors = np.array(palette)
+                tile_score = 0
+
+                # Calculate how well the palette matches the tile's own color distribution
                 for color, frequency in tile_distribution.items():
-                    # Convert color tuple back to NumPy array for distance calculation
-                    color_np = np.array(color)
-                    # Find the closest color in the palette to this tile color
-                    palette_colors = np.array(palette)
-                    distances = np.linalg.norm(palette_colors - color_np, axis=1)
-                    closest_color_distance = np.min(distances)
-                    # Penalize based on distance and frequency; more frequent colors should have lower distances
-                    score += frequency * closest_color_distance
-                if score < best_score:
-                    best_score = score
-                    best_palette = palette
-            return best_palette
+                    distances = pairwise_distances([color], palette_colors, metric='euclidean')[0]
+                    closest_distance = np.min(distances)
+                    # Apply additional weight to key colors
+                    weight = key_color_weight if color in key_colors else 1
+                    tile_score += frequency * closest_distance * weight
 
-        def apply_palette(tile, palette):
-            """
-            Apply a 4-color palette to an 8x8 tile, adjusting the tile's original color indices
-            to match the best corresponding colors in the selected palette.
-            """
-            # Ensure the tile and palette are numpy arrays with the correct type
+                # Context-aware selection: consider adjacent tiles if available
+                context_score = 0
+                if adjacent_distributions:
+                    for adj_dist in adjacent_distributions:
+                        adj_score = 0
+                        for adj_color, adj_freq in adj_dist.items():
+                            distances = pairwise_distances([adj_color], palette_colors, metric='euclidean')[0]
+                            closest_distance = np.min(distances)
+                            # Apply additional weight to key colors in adjacent tiles
+                            weight = key_color_weight if adj_color in key_colors else 1
+                            adj_score += adj_freq * closest_distance * weight
+                        context_score += adj_score  # Accumulate context score from all adjacent tiles
+
+                    # Average the context score based on the number of adjacent tiles considered
+                    context_score /= len(adjacent_distributions)
+
+                # Combine tile score and context score using the balance factor
+                combined_score = (1 - balance_factor) * tile_score + balance_factor * context_score
+
+                # Update best palette if current one is better
+                if combined_score < best_score:
+                    best_score = combined_score
+                    best_palette_index = palette_index
+
+            return best_palette_index
+
+        import numpy as np
+        from PIL import Image
+
+        from PIL import Image
+        import numpy as np
+
+        from skimage.color import deltaE_ciede2000
+        from skimage import color  # Import the color module from scikit-image
+        def apply_palette(tile, palette, dither=True):
+            # Convert the PIL Image to a NumPy array
             tile_data = np.array(tile, dtype=np.uint8)
-            palette = np.array(palette, dtype=np.uint8)
 
-            # Get the original color distribution and most frequent colors in the tile
-            tile_distribution = get_color_distribution(tile_data)
-            sorted_colors = sorted(tile_distribution.keys(), key=lambda c: tile_distribution[c], reverse=True)
+            # Ensure the data is in the correct shape and type before converting to Lab space
+            tile_lab = color.rgb2lab(tile_data)  # Directly convert the RGB NumPy array to Lab
 
-            # Map each original color to the closest color in the selected palette
-            new_color_indices = {}
-            for original_color in sorted_colors:
-                # Find the closest color in the palette to this original color
-                original_color_np = np.array(original_color)
-                distances = np.linalg.norm(palette - original_color_np, axis=1)
-                closest_palette_index = np.argmin(distances)
-                new_color_indices[original_color] = closest_palette_index
+            # Convert the palette to a NumPy array and then to Lab space
+            palette = np.array(palette, dtype=np.uint8)  # Ensure it's a NumPy array
+            palette_lab = color.rgb2lab(palette.reshape((1, 4, 3))).reshape(
+                (4, 3))  # Reshape for conversion and then back
 
-            # Create a new tile where each original color is replaced by its new palette index
+            # Prepare the new tile data
             new_tile_data = np.zeros_like(tile_data)
-            for i, row in enumerate(tile_data):
-                for j, original_color in enumerate(row):
-                    new_tile_data[i, j] = palette[new_color_indices[tuple(original_color)]]
 
-            return Image.fromarray(new_tile_data, 'RGB')
+            # Map each original color in the tile to the closest color in the palette
+            for i in range(tile_data.shape[0]):  # Iterate over rows
+                for j in range(tile_data.shape[1]):  # Iterate over columns
+                    original_color_lab = tile_lab[i, j]
+                    distances = np.linalg.norm(palette_lab - original_color_lab, axis=1)
+                    closest_palette_index = np.argmin(distances)
+                    # Assign the closest color from the palette back in RGB space
+                    new_tile_data[i, j] = palette[closest_palette_index]
 
-        def analyze_and_construct_palettes(tiles, max_palettes=8):
-            # Convert all tiles to Lab color space for better color differentiation
-            lab_tiles = [rgb2lab(np.array(tile).reshape(8, 8, 3)) for tile in tiles]
-            all_colors_lab = np.vstack([tile.reshape(-1, 3) for tile in lab_tiles])
+                    # Apply dithering if enabled
+                    if dither:
+                        error = original_color_lab - palette_lab[closest_palette_index]
+                        # Distribute errors to neighboring pixels based on a simplified Floyd-Steinberg matrix
+                        if j + 1 < tile_data.shape[1]:
+                            tile_lab[i, j + 1] += error * 7 / 16
+                        if i + 1 < tile_data.shape[0]:
+                            if j > 0:
+                                tile_lab[i + 1, j - 1] += error * 3 / 16
+                            tile_lab[i + 1, j] += error * 5 / 16
+                            if j + 1 < tile_data.shape[1]:
+                                tile_lab[i + 1, j + 1] += error * 1 / 16
 
-            # Perform K-means clustering on all colors to find global representative colors
-            kmeans_global = KMeans(n_clusters=max_palettes * 4, random_state=42)  # Increase clusters for global variety
-            kmeans_global.fit(all_colors_lab)
-            global_palette_lab = kmeans_global.cluster_centers_
+            # Convert the updated NumPy array back to a PIL Image
+            new_tile_image = Image.fromarray(new_tile_data, 'RGB')
+            return new_tile_image
 
-            # Split global colors into palettes, ensuring diversity within each palette
-            refined_palettes_lab = [global_palette_lab[i:i + 4] for i in range(0, len(global_palette_lab), 4)]
+        from skimage.color import rgb2lab, lab2rgb
+        from sklearn.cluster import MiniBatchKMeans
+        import numpy as np
+        import random
+        from skimage.color import lab2rgb
+        from sklearn.metrics.pairwise import euclidean_distances
 
-            # Convert palettes back to RGB for application and visualization
-            refined_palettes_rgb = [np.clip(lab2rgb(palette.reshape(1, 4, 3)), 0, 1) * 255 for palette in
-                                    refined_palettes_lab]
-            refined_palettes_rgb = [palette.reshape(4, 3).astype(np.uint8) for palette in refined_palettes_rgb]
+        import itertools
+
+        from skimage.color import lab2rgb, rgb2lab
+        import numpy as np
+        from PIL import Image
+
+        import numpy as np
+        from skimage.color import lab2rgb, rgb2lab
+
+        import numpy as np
+        from skimage.color import lab2rgb, rgb2lab
+        from PIL import Image
+
+        def create_refined_palettes(cluster_centers, tiles, num_palettes=8, colors_per_palette=4):
+            # Flatten and convert LAB color arrays to RGB, then clip and convert to integers.
+            flat_cluster_centers = np.vstack(cluster_centers)
+            cluster_centers_rgb = (np.clip(lab2rgb(flat_cluster_centers), 0, 1) * 255).astype(np.uint8)
+
+            # Initialize palettes and a list to keep track of color frequencies.
+            refined_palettes_rgb = [[] for _ in range(num_palettes)]
+            color_frequencies = np.zeros(len(cluster_centers_rgb), dtype=int)
+
+            # Calculate color frequencies based on their presence in tiles.
+            for tile in tiles:
+                lab_tile = rgb2lab(np.array(tile.convert('RGB'), dtype=np.float64) / 255).reshape(-1, 3)
+                for color in lab_tile:
+                    distances = np.linalg.norm(cluster_centers_rgb - color, axis=1)
+                    nearest_color_index = np.argmin(distances)
+                    color_frequencies[nearest_color_index] += 1
+
+            # Rank colors by frequency and distribute among palettes.
+            sorted_indices = np.argsort(-color_frequencies)
+            palette_counters = [0] * num_palettes
+            for color_index in sorted_indices:
+                least_filled_palette_index = palette_counters.index(min(palette_counters))
+                if palette_counters[least_filled_palette_index] < colors_per_palette:
+                    current_color = tuple(cluster_centers_rgb[color_index])
+                    if all(current_color != tuple(color) for color in refined_palettes_rgb[least_filled_palette_index]):
+                        refined_palettes_rgb[least_filled_palette_index].append(cluster_centers_rgb[color_index])
+                        palette_counters[least_filled_palette_index] += 1
+
+                if all(count == colors_per_palette for count in palette_counters):
+                    break
+
+            # Define function to calculate color distance outside of any loop
+            def color_distance(c1, c2):
+                return np.sqrt(np.sum((c1 - c2) ** 2))
+
+            # Calculate global color usage outside of the initial distribution loop
+            global_color_usage = {tuple(color): 0 for color in cluster_centers_rgb}
+            for palette in refined_palettes_rgb:
+                for color in palette:
+                    global_color_usage[tuple(color)] += 1
+
+            # Fill up any palettes that are short of colors, outside of the initial distribution loop
+            for palette_index, palette in enumerate(refined_palettes_rgb):
+                while len(palette) < colors_per_palette:
+                    best_color = None
+                    best_color_score = -np.inf  # Lower score is better; start with worst possible
+                    existing_colors_tuples = [tuple(color) for color in palette]
+
+                    for color in cluster_centers_rgb:
+                        color_tuple = tuple(color)  # Ensure color is a tuple for comparison
+                        if color_tuple not in existing_colors_tuples:  # Corrected comparison
+                            # Calculate color's overall score based on global usage and diversity
+                            usage_score = -global_color_usage[color_tuple]  # Prefer less used colors
+                            diversity_score = min(
+                                [color_distance(np.array(color), np.array(existing_color)) for existing_color in
+                                 palette] or [np.inf])  # Prefer colors different from existing ones
+                            total_score = usage_score + diversity_score
+
+                            if total_score > best_color_score:
+                                best_color_score = total_score
+                                best_color = color
+
+                    if best_color is not None:
+                        refined_palettes_rgb[palette_index].append(best_color)
+                        global_color_usage[tuple(best_color)] += 1
 
             return refined_palettes_rgb
 
-            # Ensure each palette is unique by comparing with existing ones and adjusting if too similar
-            unique_palettes_rgb = []
-            for palette in refined_palettes_rgb:
-                if not unique_palettes_rgb:  # Automatically add the first palette
-                    unique_palettes_rgb.append(palette)
-                    continue
+        from skimage.color import lab2rgb, rgb2lab
+        from sklearn.cluster import MiniBatchKMeans
+        import numpy as np
+        from PIL import Image
 
-                # Calculate distances between new palette and existing palettes
-                distances = np.array(
-                    [np.min(cdist(palette, existing, metric='euclidean')) for existing in unique_palettes_rgb])
+        def analyze_and_construct_palettes(tiles, max_palettes=8, max_colors=32, local_influence=0.5):
+            num_clusters = 150
+            # Convert PIL Images to LAB
+            lab_tiles = [rgb2lab(np.array(tile.convert('RGB'), dtype=np.float64) / 255) for tile in tiles]
+            all_tiles_lab = np.vstack([tile.reshape(-1, 3) for tile in lab_tiles])
 
-                if np.all(distances > 20):  # Threshold for color difference; adjust based on your requirements
-                    unique_palettes_rgb.append(palette)
-                else:
-                    # If the palette is too similar to an existing one, modify by shifting colors not covered
-                    # This part can be optimized based on specific needs; here we simply skip adding similar palettes
-                    continue  # In practice, you might want to adjust colors rather than skipping
+            # Perform global KMeans clustering
+            global_kmeans = MiniBatchKMeans(n_clusters=num_clusters, random_state=42)
+            global_kmeans.fit(all_tiles_lab)
+            broad_palette_lab = global_kmeans.cluster_centers_
 
-            return unique_palettes_rgb
+            # Compute global color weights
+            global_labels = global_kmeans.labels_
+            global_color_weights = np.bincount(global_labels, minlength=num_clusters) / float(len(global_labels))
 
-        def process_tiles(tiles, max_palettes=8):
+            # Adjust global color weights based on local tile colors
+            for tile_lab in lab_tiles:
+                local_labels = global_kmeans.predict(tile_lab.reshape(-1, 3))
+                local_color_weights = np.bincount(local_labels, minlength=num_clusters) / float(len(local_labels))
+                global_color_weights = (
+                                                   1 - local_influence) * global_color_weights + local_influence * local_color_weights
+
+            # Fallback for zero weights
+            if not np.any(global_color_weights):
+                global_color_weights = np.ones_like(global_color_weights) / len(global_color_weights)
+
+            # Apply weights to determine final color selection
+            weighted_colors = np.repeat(broad_palette_lab, np.maximum(global_color_weights.astype(int), 1), axis=0)
+
+            # Ensure there are weighted colors to fit
+            if weighted_colors.size == 0:
+                weighted_colors = broad_palette_lab
+
+            # Perform final KMeans clustering to determine refined palettes
+            final_kmeans = MiniBatchKMeans(n_clusters=max_colors, random_state=42)
+            final_kmeans.fit(weighted_colors)
+
+            # Construct refined palettes
+            refined_palettes_lab = [final_kmeans.cluster_centers_[i:i + 4] for i in
+                                    range(0, len(final_kmeans.cluster_centers_), 4)]
+            refined_palettes_rgb = create_refined_palettes(refined_palettes_lab, tiles)
+
+            return refined_palettes_rgb
+
+        def process_tiles(tiles, max_palettes=8, tile_width=8, tile_height=8, image_width=None, num_colors=4):
             """Process the tiles to limit them to the best 4-color palettes, based on global analysis and frequency."""
             # Step 1: Generate enhanced palettes considering the whole image
-            enhanced_palettes = analyze_and_construct_palettes(tiles, max_palettes)
+            enhanced_palettes = analyze_and_construct_palettes(tiles, max_palettes, num_colors)
 
-            # Step 2: Assign each tile the most suitable enhanced palette
-            # This step replaces the previous tile by tile palette generation and assignment
+            # Calculate the number of tiles per row if image width is known
+            tiles_per_row = image_width // tile_width if image_width else None
+
+            # Initialize list to hold the best palette for each tile
             tile_palettes = []
-            for tile in tiles:
+
+            # Step 2: Assign each tile the most suitable enhanced palette, considering adjacent tiles
+            for index, tile in enumerate(tiles):
                 np_tile = np.array(tile)
                 tile_distribution = get_color_distribution(np_tile)
-                # Find the closest enhanced palette to the original tile palette
-                closest_palette = find_best_matching_palette(tile_distribution, enhanced_palettes)
-                tile_palettes.append(closest_palette)
+
+                # Gather distributions from adjacent tiles if possible
+                adjacent_distributions = []
+                if tiles_per_row:  # If the layout of tiles is known
+                    # Determine the positions of adjacent tiles
+                    positions = [(0, -1), (0, 1), (-1, 0), (1, 0)]  # (dy, dx) pairs for up, down, left, right
+                    for dy, dx in positions:
+                        adj_index = index + dy * tiles_per_row + dx
+                        # Check if adjacent index is valid and within the same row/column as appropriate
+                        if 0 <= adj_index < len(tiles) and (
+                                dy == 0 or (index // tiles_per_row == adj_index // tiles_per_row)):
+                            adjacent_tile = tiles[adj_index]
+                            adj_distribution = get_color_distribution(np.array(adjacent_tile))
+                            adjacent_distributions.append(adj_distribution)
+
+                # Find the closest enhanced palette to the original tile palette, considering adjacent tiles
+                closest_palette_index = find_best_matching_palette(tile_distribution, enhanced_palettes,
+                                                                            adjacent_distributions)
+                tile_palettes.append(closest_palette_index)
 
             # Step 3: Apply the selected palettes to each tile
-            processed_tiles = [apply_palette(tiles[i], tile_palettes[i]) for i in range(len(tiles))]
+            processed_tiles = [apply_palette(tiles[i], enhanced_palettes[tile_palettes[i]]) for i in range(len(tiles))]
 
             return processed_tiles, enhanced_palettes
 
@@ -677,11 +856,12 @@ def create_gradio_interface():
                                                            dither=DITHER_METHODS[dither_method_key])
                 image_for_reference_palette: Image = image_for_reference_palette.convert('RGB')
 
+                palette_color_values = []
 
                 if limit_4_colors_per_tile:
                     image_for_reference_palette: Image = image.copy()
                     tiles = extract_tiles(image_for_reference_palette)
-                    processed_tiles, _ = process_tiles(tiles)
+                    processed_tiles, enhanced_palettes = process_tiles(tiles,8,8,8, image_for_reference_palette.width, num_colors)
                     # Reconstruct the image from the processed tiles
                     new_image = Image.new('RGB', image_for_reference_palette.size)
                     tile_index = 0
@@ -690,13 +870,15 @@ def create_gradio_interface():
                             new_image.paste(processed_tiles[tile_index], (x, y))
                             tile_index += 1
                     image_for_reference_palette = new_image
-
-                palette_colors = image_for_reference_palette.getcolors(maxcolors=num_colors)
-                palette_colors = [color for count, color in palette_colors]
-
-                palette_color_values = [
-                    "#{0:02x}{1:02x}{2:02x}".format(*color) for color in palette_colors
-                ]
+                    for palette in enhanced_palettes:
+                        palette_color_values.append(
+                            [f"#{color[0]:02x} #{color[1]:02x} #{color[2]:02x}" for color in palette])
+                else:
+                    palette_colors = image_for_reference_palette.getcolors(maxcolors=num_colors)
+                    palette_colors = [color for count, color in palette_colors]
+                    palette_color_values = [
+                        "#{0:02x}{1:02x}{2:02x}".format(*color) for color in palette_colors
+                    ]
 
                 if use_palette and custom_palette is not None:
                     if quantize_for_GBC and quantize_for_GBC.value == True:
