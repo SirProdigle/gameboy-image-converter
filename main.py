@@ -248,7 +248,7 @@ def reduce_tiles(image, tile_size=8, max_unique_tiles=192, similarity_threshold=
             if len(unique_tiles) == max_unique_tiles:
                 remaining_tiles = len(tiles) - (x // tile_size + y // tile_size * (width // tile_size))
                 notice = (f"**OUT OF SPARE TILES**\n"
-                          f"Tiles left to process: {remaining_tiles}   \n"
+                          f"Tiles left to process: {remaining_tiles}\n"
                           f"Consider reducing Tile Similarity Threshold")
 
         else:
@@ -284,8 +284,8 @@ def reduce_tiles(image, tile_size=8, max_unique_tiles=192, similarity_threshold=
         new_image.paste(tile, (x, y))  # Directly pasting the tile without color adjustment
 
     if not notice:
-        notice = (f"Unique tiles used : {len(unique_tiles)}/{max_unique_tiles}\n\n"
-                  f"\n\nConsider increasing Tile Similarity Threshold.")
+        notice = (f"Unique tiles used : {len(unique_tiles)}/{max_unique_tiles}\n"
+                  f"Consider increasing Tile Similarity Threshold.")
     return new_image, notice if notice else None
 
 
@@ -857,6 +857,7 @@ def create_gradio_interface():
                 image = image.convert("RGB")
             image = downscale_image(image, int(width), int(height), aspect_ratio)
             notice = None
+            image_for_reference_palette = None
             if color_limit:
                 quant_method_key = quant_method if quant_method in QUANTIZATION_METHODS else 'Median cut'
                 dither_method_key = dither_method if dither_method in DITHER_METHODS else 'None'
@@ -893,15 +894,18 @@ def create_gradio_interface():
 
                 if use_palette and custom_palette is not None:
                     if quantize_for_GBC and quantize_for_GBC.value == True:
-                        image = limit_colors(image, limit=min(num_colors, len(custom_palette.getcolors())),
-                                             quantize=QUANTIZATION_METHODS[quant_method_key],
-                                             dither=DITHER_METHODS[dither_method_key])
+                        # image = limit_colors(image, limit=min(num_colors, len(custom_palette.getcolors())),
+                        #                      quantize=QUANTIZATION_METHODS[quant_method_key],
+                        #                      dither=DITHER_METHODS[dither_method_key])
+                        image = image_for_reference_palette.copy()
                         custom_palette = custom_palette.quantize(colors=num_colors,
                                                                  method=QUANTIZATION_METHODS[quant_method_key],
                                                                  dither=DITHER_METHODS[dither_method_key])
+                        if image.mode != "P":
+                            image = image.convert("P")
                         image.putpalette(custom_palette.getpalette())
-                        image = image.quantize(colors=num_colors, method=QUANTIZATION_METHODS[quant_method_key],
-                                               dither=DITHER_METHODS[dither_method_key])
+                        # image = image.quantize(colors=num_colors, method=QUANTIZATION_METHODS[quant_method_key],
+                                               # dither=DITHER_METHODS[dither_method_key])
                     else:
                         image = limit_colors(image, limit=num_colors, quantize=QUANTIZATION_METHODS[quant_method_key],
                                              dither=DITHER_METHODS[dither_method_key], palette_image=custom_palette)
