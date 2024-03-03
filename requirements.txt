@@ -3,3 +3,5 @@ libimagequant # Adjust to the latest version available
 scikit-image
 numpy
 Pillow
+scikit-learn
+scikit-spatial
