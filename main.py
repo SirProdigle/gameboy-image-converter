@@ -489,7 +489,7 @@ def create_gradio_interface():
                     original_resolution = gr.Button("Use Original Resolution(Image)")
                 with gr.Row():
                     enable_color_limit = gr.Checkbox(label="Limit number of Colors", value=True)
-                    number_of_colors = gr.Slider(label="Target Number of colors (32 max for GB Studio)", minimum=2, maximum=128, step=1, value=4)
+                    number_of_colors = gr.Slider(label="Target Number of colors (32 max for GB Studio)", minimum=2, maximum=64, step=1, value=4)
                     limit_4_colors_per_tile = gr.Checkbox(label="Limit to 4 colors per tile, 8 palettes (For GB Studio development only)",
                                                           value=False, visible=True)
                 with gr.Group():
