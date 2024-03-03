@@ -489,13 +489,13 @@ def create_gradio_interface():
                     original_resolution = gr.Button("Use Original Resolution(Image)")
                 with gr.Row():
                     enable_color_limit = gr.Checkbox(label="Limit number of Colors", value=True)
-                    number_of_colors = gr.Slider(label="Target Number of colors", minimum=2, maximum=128, step=1, value=4)
-                    limit_4_colors_per_tile = gr.Checkbox(label="Limit to 4 colors per tile, 8 palettes",
+                    number_of_colors = gr.Slider(label="Target Number of colors (32 max for GB Studio)", minimum=2, maximum=128, step=1, value=4)
+                    limit_4_colors_per_tile = gr.Checkbox(label="Limit to 4 colors per tile, 8 palettes (For GB Studio development only)",
                                                           value=False, visible=True)
                 with gr.Group():
                     with gr.Row():
-                        reduce_tile_checkbox = gr.Checkbox(label="Reduce to 192 unique 8x8 tiles", value=False)
-                        use_tile_variance_checkbox = gr.Checkbox(label="Sort by tile complexity", value=False)
+                        reduce_tile_checkbox = gr.Checkbox(label="Reduce to 192 unique 8x8 tiles (Not needed for LOGO scene mode)", value=False)
+                        use_tile_variance_checkbox = gr.Checkbox(label="Sort by tile complexity (Complex tiles get saved first)", value=False)
                     reduce_tile_similarity_threshold = gr.Slider(label="Tile similarity threshold", minimum=0.3,
                                                                  maximum=0.99, value=0.8, step=0.01, visible=False)
                 with gr.Row():
@@ -1034,6 +1034,8 @@ def create_gradio_interface():
         def process_image(image, width, height, aspect_ratio, color_limit, num_colors, quant_method, dither_method,
                           use_palette, custom_palette, grayscale, black_and_white, bw_threshold, reduce_tile_flag,
                           reduce_tile_threshold, limit_4_colors_per_tile):
+            if num_colors <= 4:
+                limit_4_colors_per_tile = False
             text_for_palette = ""
             text_for_palette_tile_application = ""
             if image.mode != "RGB":
@@ -1078,32 +1080,38 @@ def create_gradio_interface():
                     ]
 
                 if use_palette and custom_palette is not None:
-                    if quantize_for_GBC and quantize_for_GBC.value == True and not limit_4_colors_per_tile:
-                        image = image_for_reference_palette.copy()
-                        if not enhanced_palettes or not tile_palette_mapping:
-                            processed_tiles, enhanced_palettes, text_for_palette_tile_application, tile_palette_mapping = process_tiles(extract_tiles(image),8,8,8, image_for_reference_palette.width, num_colors, True if dither_method_key != "None" else False, False)
-                        custom_palette = custom_palette.quantize(colors=num_colors,
-                                                                 method=QUANTIZATION_METHODS[quant_method_key],
-                                                                 dither=DITHER_METHODS[dither_method_key])
-                        if image.mode != "P":
-                            image = image.convert("P", palette=Image.ADAPTIVE, dither=False if dither_method_key == "None" else True)
-                        image_tiles = processed_tiles
-                        # Ensure the custom_palette_palette is a list of RGB tuples
-                        custom_palette_palette = custom_palette.getpalette()
-                        custom_palette_palette = [(r, g, b) for r, g, b in
-                                                  zip(custom_palette_palette[0::3], custom_palette_palette[1::3],
-                                                      custom_palette_palette[2::3])]
+                    if quantize_for_GBC and quantize_for_GBC.value == True and not reduce_tile_flag:
+                        if limit_4_colors_per_tile:
+                            image = image_for_reference_palette.copy()
+                            if not enhanced_palettes or not tile_palette_mapping:
+                                processed_tiles, enhanced_palettes, text_for_palette_tile_application, tile_palette_mapping = process_tiles(extract_tiles(image),8,8,8, image_for_reference_palette.width, num_colors, True if dither_method_key != "None" else False, False)
+                            custom_palette = custom_palette.quantize(colors=num_colors,
+                                                                     method=QUANTIZATION_METHODS[quant_method_key],
+                                                                     dither=DITHER_METHODS[dither_method_key])
+                            if image.mode != "P":
+                                image = image.convert("P", palette=Image.ADAPTIVE, dither=False if dither_method_key == "None" else True)
+                            image_tiles = processed_tiles
+                            # Ensure the custom_palette_palette is a list of RGB tuples
+                            custom_palette_palette = custom_palette.getpalette()
+                            custom_palette_palette = [(r, g, b) for r, g, b in
+                                                      zip(custom_palette_palette[0::3], custom_palette_palette[1::3],
+                                                          custom_palette_palette[2::3])]
 
-                        mapped_image = Image.new('RGB', image.size)
-                        for index, tile in enumerate(image_tiles):
-                            tile_palette = enhanced_palettes[tile_palette_mapping[index]]
-                            # No change needed here to mapped_colors because we're doing pixel-wise color replacement now
-                            # Apply new colors to the tile based on the mapping
-                            recolored_tile = apply_mapped_colors_to_tile(tile, tile_palette, custom_palette_palette)
-                            # Paste the recolored tile back into the image
-                            mapped_image.paste(recolored_tile,
-                                        (index % (image.width // 8) * 8, index // (image.width // 8) * 8))
-                        image = mapped_image
+                            mapped_image = Image.new('RGB', image.size)
+                            for index, tile in enumerate(image_tiles):
+                                tile_palette = enhanced_palettes[tile_palette_mapping[index]]
+                                # No change needed here to mapped_colors because we're doing pixel-wise color replacement now
+                                # Apply new colors to the tile based on the mapping
+                                recolored_tile = apply_mapped_colors_to_tile(tile, tile_palette, custom_palette_palette)
+                                # Paste the recolored tile back into the image
+                                mapped_image.paste(recolored_tile,
+                                            (index % (image.width // 8) * 8, index // (image.width // 8) * 8))
+                            image = mapped_image
+                        else:
+                            image = image_for_reference_palette.copy()
+                            image = limit_colors(image, limit=num_colors, quantize=QUANTIZATION_METHODS[quant_method_key],
+                                             dither=DITHER_METHODS[dither_method_key], palette_image=custom_palette)
+                            image
 
                     else:
                         image = limit_colors(image, limit=num_colors, quantize=QUANTIZATION_METHODS[quant_method_key],
@@ -1141,7 +1149,9 @@ def create_gradio_interface():
                         for palette in enhanced_palettes:
                             palette_color_values.append(
                                 [f"#{color[0]:02x}{color[1]:02x}{color[2]:02x}" for color in palette])
-
+                elif reduce_tile_flag:
+                    image, notice = reduce_tiles(image, similarity_threshold=reduce_tile_threshold)
+                    image_for_reference_palette, notice = reduce_tiles_index(image_for_reference_palette, similarity_threshold=reduce_tile_threshold)
 
                 # Return all necessary components including the processed image and color values
                 # set pallete_color_values to exactly 4 values nomatter if there's less or more
