@@ -245,6 +245,64 @@ def convert_to_rgb_with_four_colors(image: Image, target_colors: list):
             new_rgb_image.putpixel((x, y), color_mapping[index])
 
     return new_rgb_image
+def normalize_tile(tile):
+    """
+    Convert a tile to a normalized form based on the frequency of each color,
+    disregarding the specific colors themselves.
+    """
+    # In P mode, the data is already flat: a sequence of indices, not rows of pixels
+    flat_tile = list(tile.getdata())
+    # Count frequency of each color (index) in the tile
+    color_counts = Counter(flat_tile)
+    # Sort colors by frequency (and then by index value to ensure consistency)
+    sorted_colors = sorted(color_counts.keys(), key=lambda color: (-color_counts[color], color))
+    # Map each color to its rank (most common = 0, next = 1, etc.)
+    color_map = {color: rank for rank, color in enumerate(sorted_colors)}
+    # Create a new tile with normalized color values
+    normalized_pixels = [color_map[color] for color in flat_tile]
+    # Convert back to an Image
+    new_tile = Image.new('P', tile.size)
+    new_tile.putdata(normalized_pixels)
+    return new_tile
+
+def tile_similarity_indexed(tile1, tile2):
+    """
+    Compare two tiles based on their normalized forms.
+    """
+    # Convert both tiles to their normalized forms
+    norm_tile1 = normalize_tile(tile1)
+    norm_tile2 = normalize_tile(tile2)
+    # Now compare the normalized tiles directly
+    data1 = norm_tile1.getdata()
+    data2 = norm_tile2.getdata()
+    # Measure similarity as the percentage of matching pixels
+    matches = sum(1 for p1, p2 in zip(data1, data2) if p1 == p2)
+    return matches / len(data1)
+
+def map_pattern_to_palette(source_tile, target_tile):
+    # Get the normalized form of the source tile to understand its pattern
+    norm_source_tile = normalize_tile(source_tile)
+    norm_source_data = list(norm_source_tile.getdata())
+
+    # Get the data from the target tile (these are palette indexes)
+    target_data = list(target_tile.getdata())
+
+    # Create a mapping from the normalized source pattern to the target's indexes
+    pattern_to_color = {}
+    for norm_val, target_val in zip(norm_source_data, target_data):
+        if norm_val not in pattern_to_color:  # if this pattern not yet mapped, map to current color in target
+            pattern_to_color[norm_val] = target_val
+
+    # Apply this mapping to create a new tile based on the source pattern but using target's color indexes
+    new_tile_data = [pattern_to_color[norm_val] for norm_val in norm_source_data]
+
+    # Create a new image for the mapped tile
+    new_tile = Image.new('P', target_tile.size)
+    new_tile.putpalette(target_tile.getpalette())
+    new_tile.putdata(new_tile_data)
+    return new_tile
+
+
 def reduce_tiles_index(image: Image, tile_size=8, max_unique_tiles=192, similarity_threshold=0.7, use_tile_variance=False, custom_palette_colors=None):
     width, height = image.size
     width -= width % tile_size
@@ -298,8 +356,11 @@ def reduce_tiles_index(image: Image, tile_size=8, max_unique_tiles=192, similari
 
     # Paint the new image
     for (x, y), (ux, uy) in tile_mapping.items():
-        tile = image.crop((ux, uy, ux + tile_size, uy + tile_size))
-        new_image.paste(tile, (x, y))
+        original_tile = image.crop((x, y, x + tile_size, y + tile_size))  # Get the original tile
+        pattern_tile = image.crop((ux, uy, ux + tile_size, uy + tile_size))  # Get the tile to copy the pattern from
+        new_tile = map_pattern_to_palette(pattern_tile,
+                                          original_tile)  # Create a new tile with the original palette but new pattern
+        new_image.paste(new_tile, (x, y))
 
     if len(unique_tiles) < max_unique_tiles:
         notice = f"Unique tiles used: {len(unique_tiles)}/{max_unique_tiles}\nConsider increasing Tile Similarity Threshold."
@@ -1120,16 +1181,20 @@ def create_gradio_interface():
                     image = limit_colors(image, limit=num_colors, quantize=QUANTIZATION_METHODS[quant_method_key],
                                          dither=DITHER_METHODS[dither_method_key])
                 if reduce_tile_flag and limit_4_colors_per_tile:
-                    image = image_for_reference_palette.copy()
+                    #image = image_for_reference_palette.copy()
                     # Apply our custom_palette to the image, without quantising, just the palette
+                    image = image_for_reference_palette.copy()
+                    image = limit_colors(image, limit=num_colors, quantize=QUANTIZATION_METHODS[quant_method_key],
+                                         dither=DITHER_METHODS[dither_method_key])
                     custom_palette_info = custom_palette.getcolors()
                     # just keep the tuple colours
                     for i in range(len(custom_palette_info)):
                         custom_palette_info[i] = custom_palette_info[i][1]
+                    enhanced_palettes = analyze_and_construct_palettes(extract_tiles(image), max_palettes=8, max_colors=num_colors)
                     image, notice = reduce_tiles_index(image, similarity_threshold=reduce_tile_threshold, custom_palette_colors=custom_palette_info)
                     image = image.convert("RGB")
                     tiles = extract_tiles(image)
-                    processed_tiles, enhanced_palettes, text_for_palette_tile_application, tile_palette_mapping = process_tiles(tiles,8,8,8, image_for_reference_palette.width, len(image.getcolors()))
+                    processed_tiles, enhanced_palettes, text_for_palette_tile_application, tile_palette_mapping = process_tiles(tiles,8,8,8, image_for_reference_palette.width, len(image.getcolors()), enhanced_palettes=enhanced_palettes)
 
                     if use_custom_palette:
                         image_tiles = processed_tiles
