@@ -310,9 +310,6 @@ def reduce_tiles_index(image: Image, tile_size=8, max_unique_tiles=192, similari
     # convert to P mode perfectly with exactly same colour info
     image = image.crop((0, 0, width, height)).convert('P', colors=256, dither=Image.NONE)
 
-    # Color count and top colors logic from the 'reduce_tiles' function
-    color_counts = image.getcolors(width * height)  # Get all colors in the image
-    top_colors = [color for count, color in sorted(color_counts, reverse=True)]  # Extract the colors
 
     # Initialize variables
     tiles = [(x, y, image.crop((x, y, x + tile_size, y + tile_size)))
@@ -328,12 +325,6 @@ def reduce_tiles_index(image: Image, tile_size=8, max_unique_tiles=192, similari
     new_image = Image.new('P', (width, height))  # Use 'P' mode for the new image
     image_palette = image.getpalette()  # Get the palette of the original image
     new_image.putpalette(image_palette)  # Apply the same palette to the new image
-
-    # Add a block for each of the top colors in the image to unique_tiles
-    for i, color in enumerate(top_colors[:4]):  # Limit to top 4 colors for initial unique tiles
-        color_tile = Image.new('P', (tile_size, tile_size), 0)
-        color_tile.putpalette(image_palette)
-        unique_tiles.append((-tile_size * (i + 1), -tile_size * (i + 1), color_tile))
 
     notice = ''
     for x, y, tile in tiles:
