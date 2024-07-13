@@ -1,9 +1,10 @@
 from collections import Counter
 
 import gradio as gr
-from PIL import Image
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
 from skimage.metrics import structural_similarity as ssim
 import numpy as np
+from scipy.spatial import cKDTree
 from numpy import std
 from PIL import Image, features
 import random
@@ -14,7 +15,6 @@ import time
 from sklearn.cluster import KMeans
 from skimage.color import rgb2lab, lab2rgb  # For color space conversion
 from sklearn.cluster import KMeans
-import numpy as np
 from collections import Counter
 from scipy.spatial.distance import cdist  # For calculating distances between color sets
 import traceback
@@ -80,6 +80,97 @@ def dominant_color(tile, color_palette):
         unique, counts = np.unique(arr, axis=0, return_counts=True)
         dominant_index = np.argmax(counts)
         return tuple(unique[dominant_index])  # Convert to tuple to match expected format
+
+
+def apply_gothic_filter(image, threshold, dot_size, spacing, contrast_boost=1.5, edge_enhance=True, noise_factor=0.1,
+                        apply_blur=True, irregular_shape=True, irregular_size=True):
+    original_mode = image.mode
+    if original_mode == 'P':
+        image = image.convert('RGB')
+
+    # Increase contrast
+    enhancer = ImageEnhance.Contrast(image)
+    image = enhancer.enhance(contrast_boost)
+
+    # Edge enhancement
+    if edge_enhance:
+        image = image.filter(ImageFilter.EDGE_ENHANCE_MORE)
+
+    img_array = np.array(image)
+
+    # Determine background color
+    unique_colors, color_counts = np.unique(img_array.reshape(-1, 3), axis=0, return_counts=True)
+    tree = cKDTree(unique_colors)
+
+    # Choose background color: darkest color among the top 3 most common colors
+    top_colors = unique_colors[np.argsort(color_counts)[-3:]]
+    background_color = tuple(top_colors[np.argmin(np.sum(top_colors, axis=1))])
+
+    result = Image.new('RGB', image.size, color=background_color)
+    draw = ImageDraw.Draw(result)
+
+    # Create a distressed texture if irregular size is enabled
+    if irregular_size:
+        texture = Image.new('L', image.size)
+        texture_draw = ImageDraw.Draw(texture)
+        for _ in range(int(image.width * image.height * 0.1)):  # Adjust density as needed
+            x = random.randint(0, image.width - 1)
+            y = random.randint(0, image.height - 1)
+            texture_draw.point((x, y), fill=random.randint(0, 255))
+
+    for y in range(0, image.height, spacing):
+        for x in range(0, image.width, spacing):
+            original_color = img_array[y, x]
+            luminance = 0.299 * original_color[0] + 0.587 * original_color[1] + 0.114 * original_color[2]
+
+            if luminance > threshold:
+                _, index = tree.query(original_color)
+                nearest_color = tuple(unique_colors[index])
+
+                # Determine dot size
+                if irregular_size:
+                    texture_value = texture.getpixel((x, y))
+                    adjusted_dot_size = max(1, int(dot_size * (texture_value / 255)))
+                else:
+                    adjusted_dot_size = dot_size
+
+                # Add slight randomness to dot position
+                x_offset = int(random.uniform(-spacing / 2, spacing / 2) * noise_factor)
+                y_offset = int(random.uniform(-spacing / 2, spacing / 2) * noise_factor)
+
+                if irregular_shape:
+                    # Draw an irregular shape
+                    points = []
+                    for i in range(8):  # 8-sided irregular shape
+                        angle = i * (2 * np.pi / 8) + random.uniform(0, np.pi / 4)
+                        r = adjusted_dot_size * (1 + random.uniform(-0.2, 0.2))  # Vary the radius
+                        px = x + x_offset + int(r * np.cos(angle))
+                        py = y + y_offset + int(r * np.sin(angle))
+                        points.append((px, py))
+                    draw.polygon(points, fill=nearest_color)
+                else:
+                    # Draw a regular circle
+                    draw.ellipse([(x + x_offset - adjusted_dot_size, y + y_offset - adjusted_dot_size),
+                                  (x + x_offset + adjusted_dot_size, y + y_offset + adjusted_dot_size)],
+                                 fill=nearest_color)
+
+    # Apply a slight blur to soften the effect
+    if apply_blur:
+        result = result.filter(ImageFilter.GaussianBlur(radius=0.5))
+
+    if original_mode == 'P':
+        # Get the number of colors in the original palette image
+        original_colors = image.getcolors()
+        if original_colors is None:
+            # If there are more than 256 colors, default to 256
+            original_num_colors = 256
+        else:
+            original_num_colors = len(original_colors)
+
+        # Quantize the result to match the original number of colors
+        result = result.quantize(colors=original_num_colors, method=Image.MEDIANCUT)
+
+    return result
 
 
 def most_common_surrounding_color(image, x, y, tile_size, default_color):
@@ -559,6 +650,19 @@ def create_gradio_interface():
                     use_custom_palette = gr.Checkbox(label="Use Custom Color Palette", value=True)
                     palette_image = gr.Image(label="Color Palette Image", type="pil", visible=True,
                                              value=os.path.join(os.path.dirname(__file__), "gb_palette.png"))
+                with gr.Group():
+                    gr.Markdown("### Gothic Filter")
+                    enable_gothic_filter = gr.Checkbox(label="Enable Gothic Filter", value=False)
+                    brightness_threshold = gr.Slider(label="Brightness Threshold", minimum=0, maximum=255, value=0,
+                                                     step=1)
+                    dot_size = gr.Slider(label="Dot Size", minimum=0.25, maximum=6, value=1, step=0.25)
+                    spacing = gr.Slider(label="Spacing", minimum=0, maximum=10, value=1, step=1)
+                    contrast_boost = gr.Slider(label="Contrast Boost", minimum=1.0, maximum=2.0, value=1.5, step=0.1)
+                    noise_factor = gr.Slider(label="Noise Factor", minimum=0, maximum=1, value=0.5, step=0.05)
+                    edge_enhance = gr.Checkbox(label="Edge Enhancement", value=False)
+                    apply_blur = gr.Checkbox(label="Apply Blur", value=False)
+                    irregular_shape = gr.Checkbox(label="Irregular Dot Shape", value=False)
+                    irregular_size = gr.Checkbox(label="Irregular Dot Size", value=False)
                 is_grayscale = gr.Checkbox(label="Convert to Grayscale", value=False)
                 with gr.Row():
                     is_black_and_white = gr.Checkbox(label="Convert to Black and White", value=False)
@@ -1085,7 +1189,8 @@ def create_gradio_interface():
             return new_tile
         def process_image(image, width, height, aspect_ratio, color_limit, num_colors, quant_method, dither_method,
                           use_palette, custom_palette, grayscale, black_and_white, bw_threshold, reduce_tile_flag,
-                          reduce_tile_threshold, limit_4_colors_per_tile):
+                          reduce_tile_threshold, limit_4_colors_per_tile, enable_gothic_filter, brightness_threshold, dot_size, spacing, contrast_boost,
+                          noise_factor, edge_enhance, apply_blur, irregular_shape, irregular_size):
             if num_colors <= 4:
                 limit_4_colors_per_tile = False
             text_for_palette = ""
@@ -1209,6 +1314,13 @@ def create_gradio_interface():
                     image, notice = reduce_tiles(image, similarity_threshold=reduce_tile_threshold)
                     image_for_reference_palette, notice = reduce_tiles_index(image_for_reference_palette, similarity_threshold=reduce_tile_threshold)
 
+                if enable_gothic_filter:
+                    # Apply the gothic filter after all other processing
+                    image = apply_gothic_filter(image, brightness_threshold, dot_size, spacing, contrast_boost,
+                                                edge_enhance, noise_factor, apply_blur, irregular_shape, irregular_size)
+                    image_for_reference_palette = apply_gothic_filter(image_for_reference_palette, brightness_threshold, dot_size, spacing, contrast_boost,
+                                                                      edge_enhance, noise_factor, apply_blur, irregular_shape, irregular_size)
+
                 # Return all necessary components including the processed image and color values
                 # set pallete_color_values to exactly 4 values nomatter if there's less or more
                 for i in range(len(palette_color_values)):
@@ -1236,7 +1348,8 @@ def create_gradio_interface():
 
         def process_image_folder(input_files, width, height, aspect_ratio, color_limit, num_colors, quant_method, dither_method,
                                  use_palette, custom_palette, grayscale, black_and_white, bw_threshold, reduce_tile_flag,
-                                    reduce_tile_threshold, limit_4_colors_per_tile):
+                                    reduce_tile_threshold, limit_4_colors_per_tile, enable_gothic_filter, brightness_threshold, dot_size, spacing, contrast_boost,
+                                 noise_factor, edge_enhance, apply_blur, irregular_shape, irregular_size):
             folder_name = "output_" + str(random.randint(0, 100000))
             while os.path.exists(folder_name):
                 folder_name = "output_" + str(random.randint(0, 100000))
@@ -1251,7 +1364,8 @@ def create_gradio_interface():
                     imageData = Image.open(file.name)
                     result = process_image(imageData, width, height, aspect_ratio, color_limit, num_colors, quant_method, dither_method,
                                            use_palette, custom_palette, grayscale, black_and_white, bw_threshold, reduce_tile_flag,
-                                           reduce_tile_threshold, limit_4_colors_per_tile)
+                                           reduce_tile_threshold, limit_4_colors_per_tile, enable_gothic_filter, brightness_threshold, dot_size, spacing, contrast_boost,
+                                           noise_factor, edge_enhance, apply_blur, irregular_shape, irregular_size)
                     result[0].save(os.path.join(folder_name, os.path.basename(input_files[index].name)))
                     result[2].save(os.path.join(folder_name, os.path.basename(input_files[index].name).replace(".png", "_palette.png").replace(".jpg", "_palette.jpg")))
                     text_for_palette.append(f"File {index + 1}: {os.path.basename(input_files[index].name)}\n{result[1]}")
@@ -1274,7 +1388,10 @@ def create_gradio_interface():
                              inputs=[image_input, new_width, new_height, keep_aspect_ratio, enable_color_limit,
                                      number_of_colors, quantization_method, dither_method, use_custom_palette,
                                      palette_image, is_grayscale, is_black_and_white, black_and_white_threshold,
-                                     reduce_tile_checkbox, reduce_tile_similarity_threshold, limit_4_colors_per_tile],
+                                     reduce_tile_checkbox, reduce_tile_similarity_threshold, limit_4_colors_per_tile,
+                                     enable_gothic_filter, brightness_threshold, dot_size, spacing, contrast_boost,
+                                     noise_factor, edge_enhance, apply_blur, irregular_shape, irregular_size
+                                     ],
                              outputs=[image_output, palette_text,
                                       image_output_no_palette, notice_text])
 
@@ -1282,7 +1399,11 @@ def create_gradio_interface():
                                     inputs=[folder_input, new_width, new_height, keep_aspect_ratio, enable_color_limit,
                                             number_of_colors, quantization_method, dither_method, use_custom_palette,
                                             palette_image, is_grayscale, is_black_and_white, black_and_white_threshold,
-                                            reduce_tile_checkbox, reduce_tile_similarity_threshold, limit_4_colors_per_tile],
+                                            reduce_tile_checkbox, reduce_tile_similarity_threshold, limit_4_colors_per_tile,
+                                            enable_gothic_filter, brightness_threshold, dot_size, spacing,
+                                            contrast_boost,
+                                            noise_factor, edge_enhance, apply_blur, irregular_shape, irregular_size
+                                            ],
                                     outputs=[image_output_zip, palette_text,
                                              image_output_no_palette, notice_text])
 
