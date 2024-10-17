@@ -92,4 +92,4 @@ This project is [MIT](https://opensource.org/licenses/MIT) licensed.
 
 ---
 
-Made with ❤️ by [Your Name](https://github.com/yourusername)
+Made with ❤️ by [Prodigle](https://github.com/sirprodigle)
