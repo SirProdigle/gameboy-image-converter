@@ -1,3 +1,7 @@
+fastapi==0.111.0
+starlette==0.37.2
+pydantic==2.8.2
+pydantic_core==2.20.1
 gradio==4.19.2
 libimagequant==2.17.0.0
 scikit-image==0.24.0
