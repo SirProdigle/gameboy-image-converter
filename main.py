@@ -196,6 +196,7 @@ def normalize_tile(tile):
     color_map = {color: rank for rank, color in enumerate(sorted_colors)}
     normalized_pixels = [color_map[color] for color in flat_tile]
     new_tile = Image.new('P', tile.size)
+    new_tile.putpalette(tile.getpalette())
     new_tile.putdata(normalized_pixels)
     return new_tile
 
@@ -213,8 +214,12 @@ def map_pattern_to_palette(source_tile, target_tile):
     norm_source_tile = normalize_tile(source_tile)
     norm_source_data = list(norm_source_tile.getdata())
     target_data = list(target_tile.getdata())
-    pattern_to_color = {norm_val: target_val for norm_val, target_val in zip(norm_source_data, target_data) if norm_val not in target_data}
-    new_tile_data = [pattern_to_color[norm_val] for norm_val in norm_source_data]
+    pattern_to_color = {}
+    for norm_val, target_val in zip(norm_source_data, target_data):
+        if norm_val not in pattern_to_color:
+            pattern_to_color[norm_val] = target_val
+
+    new_tile_data = [pattern_to_color.get(norm_val, 0) for norm_val in norm_source_data] # Replace with `0` if not found
     new_tile = Image.new('P', target_tile.size)
     new_tile.putpalette(target_tile.getpalette())
     new_tile.putdata(new_tile_data)
@@ -357,9 +362,15 @@ def convert_to_black_and_white(image: Image, threshold: int = 128, is_inversed: 
 def extract_tiles(image, tile_size=(TILE_SIZE, TILE_SIZE)):
     """Extract tiles from the image."""
     tiles = []
+    if image.width <= 0 or image.height <= 0:
+        return tiles # Return empty list if image has no width or height
+
     for y in range(0, image.height, tile_size[1]):
         for x in range(0, image.width, tile_size[0]):
             box = (x, y, x + tile_size[0], y + tile_size[1])
+            # Add check to ensure box coordinates are valid
+            if box[3] <= box[1] or box[2] <= box[0]:
+                continue # Skip invalid box
             tiles.append(image.crop(box))
     return tiles
 
@@ -384,8 +395,11 @@ def get_color_distribution(tile):
 def find_best_matching_palette(tile_distribution, existing_palettes, adjacent_distributions=None,
                                balance_factor=0.5, key_color_weight=1):
     """Finds the best matching palette for a tile, considering adjacent tiles and key colors."""
+    if not existing_palettes:
+        return 0  # Return default palette index if no palettes exist
+
     best_score = float('inf')
-    best_palette_index = None
+    best_palette_index = 0 # Default to the first palette if none is better
     key_colors = [(255, 255, 255), (0, 0, 0)]
 
     for palette_index, palette in enumerate(existing_palettes):
@@ -549,6 +563,9 @@ def process_tiles(tiles, max_palettes=8, tile_width=TILE_SIZE, tile_height=TILE_
     if not enhanced_palettes:
         enhanced_palettes = analyze_and_construct_palettes(tiles, max_palettes, num_colors)
 
+    if not enhanced_palettes: # Handle empty palettes case
+        return tiles, [], "", []
+
     tiles_per_row = image_width // tile_width if image_width else None
     tile_palettes = []
     palette_for_tile_text = ""
@@ -575,7 +592,15 @@ def process_tiles(tiles, max_palettes=8, tile_width=TILE_SIZE, tile_height=TILE_
         x, y = index % tiles_per_row, index // tiles_per_row
         palette_for_tile_text += f"Tile at ({x},{y}) uses palette {closest_palette_index + 1}\n"
         tile_palette_mapping.append(closest_palette_index)
-        processed_tiles = [apply_palette(tiles[i], enhanced_palettes[tile_palettes[i]], dither=should_dither) for i in range(len(tiles))]
+
+    processed_tiles = []
+    for i in range(len(tiles)):
+        try:
+            processed_tiles.append(apply_palette(tiles[i], enhanced_palettes[tile_palettes[i]], dither=should_dither))
+        except IndexError as e:
+            print(f"IndexError: tile_palettes[{i}] = {tile_palettes[i]}, len(enhanced_palettes) = {len(enhanced_palettes)}")
+            raise e
+
 
     return processed_tiles, enhanced_palettes, palette_for_tile_text, tile_palette_mapping
 
@@ -601,12 +626,12 @@ def apply_mapped_colors_to_tile(tile, tile_palette, custom_palette_palette):
 
     return new_tile
 
-# Main Image Processing Function
+# Main Image Processing Function (updated to accept quantize_for_GBC and use_tile_variance)
 def process_image(image, width, height, aspect_ratio, color_limit, num_colors, quant_method, dither_method,
                   use_palette, custom_palette, grayscale, black_and_white, bw_threshold, reduce_tile_flag,
                   reduce_tile_threshold, limit_4_colors_per_tile, enable_gothic_filter, brightness_threshold,
                   dot_size, spacing, contrast_boost, noise_factor, edge_enhance, apply_blur, irregular_shape,
-                  irregular_size):
+                  irregular_size, quantize_for_GBC, use_tile_variance):
     """Processes the image based on the given parameters."""
     if num_colors <= 4:
         limit_4_colors_per_tile = False
@@ -639,7 +664,7 @@ def process_image(image, width, height, aspect_ratio, color_limit, num_colors, q
                 tiles,
                 image_width=image_for_reference_palette.width,
                 num_colors=num_colors,
-                should_dither=dither_method_key != "None"
+                should_dither=(dither_method_key != "None")
             )
             new_image = Image.new('RGB', image_for_reference_palette.size)
             tile_index = 0
@@ -655,7 +680,7 @@ def process_image(image, width, height, aspect_ratio, color_limit, num_colors, q
             palette_color_values = [f"#{c[0]:02x}{c[1]:02x}{c[2]:02x}" for c in palette_colors]
 
         if use_palette and custom_palette is not None:
-            if quantize_for_GBC.value and not reduce_tile_flag:
+            if quantize_for_GBC and not reduce_tile_flag:
                 if limit_4_colors_per_tile:
                     image = image_for_reference_palette.copy()
                     if not enhanced_palettes or not tile_palette_mapping:
@@ -663,7 +688,7 @@ def process_image(image, width, height, aspect_ratio, color_limit, num_colors, q
                             extract_tiles(image),
                             image_width=image_for_reference_palette.width,
                             num_colors=num_colors,
-                            should_dither=dither_method_key != "None"
+                            should_dither=(dither_method_key != "None")
                         )
                     custom_palette = custom_palette.quantize(
                         colors=num_colors,
@@ -672,12 +697,15 @@ def process_image(image, width, height, aspect_ratio, color_limit, num_colors, q
                     )
                     image = image.convert("P", palette=Image.ADAPTIVE, dither=Image.Dither.NONE if dither_method_key == "None" else Image.Dither.FLOYDSTEINBERG)
                     image_tiles = processed_tiles
-                    custom_palette_palette = [(r, g, b) for r, g, b in zip(custom_palette.getpalette()[0::3], custom_palette.getpalette()[1::3], custom_palette.getpalette()[2::3])]
+                    custom_palette_palette = [(r, g, b) for r, g, b in zip(custom_palette.getpalette()[0::3],
+                                                                            custom_palette.getpalette()[1::3],
+                                                                            custom_palette.getpalette()[2::3])]
                     mapped_image = Image.new('RGB', image.size)
                     for index, tile in enumerate(image_tiles):
                         tile_palette = enhanced_palettes[tile_palette_mapping[index]]
                         recolored_tile = apply_mapped_colors_to_tile(tile, tile_palette, custom_palette_palette)
-                        mapped_image.paste(recolored_tile, (index % (image.width // TILE_SIZE) * TILE_SIZE, index // (image.width // TILE_SIZE) * TILE_SIZE))
+                        mapped_image.paste(recolored_tile, (index % (image.width // TILE_SIZE) * TILE_SIZE,
+                                                            index // (image.width // TILE_SIZE) * TILE_SIZE))
                     image = mapped_image
                 else:
                     image = limit_colors(
@@ -720,7 +748,7 @@ def process_image(image, width, height, aspect_ratio, color_limit, num_colors, q
             image, notice = reduce_tiles_index(
                 image,
                 similarity_threshold=reduce_tile_threshold,
-                custom_palette_colors=custom_palette_info
+                use_tile_variance=use_tile_variance
             )
             image = image.convert("RGB")
             tiles = extract_tiles(image)
@@ -731,21 +759,24 @@ def process_image(image, width, height, aspect_ratio, color_limit, num_colors, q
                 enhanced_palettes=enhanced_palettes
             )
 
-            if use_custom_palette:
+            if use_palette:
                 image_tiles = processed_tiles
                 mapped_image = Image.new('RGB', image.size)
                 for index, tile in enumerate(image_tiles):
-                    image_for_reference_palette.paste(tile, (index % (image.width // TILE_SIZE) * TILE_SIZE, index // (image.width // TILE_SIZE) * TILE_SIZE))
+                    image_for_reference_palette.paste(tile, (index % (image.width // TILE_SIZE) * TILE_SIZE,
+                                                               index // (image.width // TILE_SIZE) * TILE_SIZE))
                     tile_palette = enhanced_palettes[tile_palette_mapping[index]]
                     recolored_tile = apply_mapped_colors_to_tile(tile, tile_palette, custom_palette_info)
-                    mapped_image.paste(recolored_tile, (index % (image.width // TILE_SIZE) * TILE_SIZE, index // (image.width // TILE_SIZE) * TILE_SIZE))
+                    mapped_image.paste(recolored_tile, (index % (image.width // TILE_SIZE) * TILE_SIZE,
+                                                        index // (image.width // TILE_SIZE) * TILE_SIZE))
                 image = mapped_image
                 palette_color_values = [[f"#{c[0]:02x}{c[1]:02x}{c[2]:02x}" for c in palette] for palette in enhanced_palettes]
         elif reduce_tile_flag:
-            image, notice = reduce_tiles(image, similarity_threshold=reduce_tile_threshold)
+            image, notice = reduce_tiles(image, similarity_threshold=reduce_tile_threshold, use_tile_variance=use_tile_variance)
             image_for_reference_palette, notice = reduce_tiles_index(
                 image_for_reference_palette,
-                similarity_threshold=reduce_tile_threshold
+                similarity_threshold=reduce_tile_threshold,
+                use_tile_variance=use_tile_variance
             )
 
         if enable_gothic_filter:
@@ -772,15 +803,15 @@ def process_image(image, width, height, aspect_ratio, color_limit, num_colors, q
     if black_and_white:
         image = convert_to_black_and_white(image, threshold=bw_threshold)
     if reduce_tile_flag:
-        image, notice = reduce_tiles(image, similarity_threshold=reduce_tile_threshold)
+        image, notice = reduce_tiles(image, similarity_threshold=reduce_tile_threshold, use_tile_variance=use_tile_variance.value)
     return image, text_for_palette, None, notice
 
-# File Processing Function
+# File Processing Function (updated to accept quantize_for_GBC and use_tile_variance)
 def process_image_folder(input_files, width, height, aspect_ratio, color_limit, num_colors, quant_method,
                          dither_method, use_palette, custom_palette, grayscale, black_and_white, bw_threshold,
                          reduce_tile_flag, reduce_tile_threshold, limit_4_colors_per_tile, enable_gothic_filter,
                          brightness_threshold, dot_size, spacing, contrast_boost, noise_factor, edge_enhance,
-                         apply_blur, irregular_shape, irregular_size):
+                         apply_blur, irregular_shape, irregular_size, quantize_for_GBC, use_tile_variance):
     """Processes a folder of images."""
     folder_name = f"output_{random.randint(0, 100000)}"
     while os.path.exists(folder_name):
@@ -799,7 +830,7 @@ def process_image_folder(input_files, width, height, aspect_ratio, color_limit, 
                 dither_method, use_palette, custom_palette, grayscale, black_and_white, bw_threshold,
                 reduce_tile_flag, reduce_tile_threshold, limit_4_colors_per_tile, enable_gothic_filter,
                 brightness_threshold, dot_size, spacing, contrast_boost, noise_factor, edge_enhance,
-                apply_blur, irregular_shape, irregular_size
+                apply_blur, irregular_shape, irregular_size, quantize_for_GBC, use_tile_variance
             )
             base_name = os.path.basename(file.name)
             result[0].save(os.path.join(folder_name, base_name))
@@ -832,12 +863,7 @@ def process_image_folder(input_files, width, height, aspect_ratio, color_limit, 
         print(traceback.format_exc())
         return None, f"Error processing folder: {e}", None, None
 
-# Gradio UI Setup
-original_width = gr.State(value=0)
-original_height = gr.State(value=0)
-quantize_for_GBC = gr.State(False)
-use_tile_variance = gr.State(False)
-
+# Gradio UI Setup (states moved inside create_gradio_interface)
 def capture_original_dimensions(image):
     """Captures the original dimensions of the uploaded image."""
     if image is None:
@@ -845,17 +871,36 @@ def capture_original_dimensions(image):
     width, height = image.size
     return width, height, image
 
-def adjust_for_aspect_ratio(keep_aspect, current_width, current_height):
+def adjust_for_aspect_ratio(keep_aspect, current_width, current_height, orig_w, orig_h):
     """Adjusts the dimensions to maintain aspect ratio if the option is selected."""
-    if keep_aspect and original_width.value and original_height.value:
-        aspect_ratio = original_width.value / original_height.value
+    if keep_aspect and orig_w.value and orig_h.value:
+        aspect_ratio = orig_w.value / orig_h.value
         new_height = int(current_width / aspect_ratio)
         return current_width, new_height
     return current_width, current_height
 
+def on_original_resolution_click(orig_w, orig_h):
+    return False, orig_w.value, orig_h.value
+
+def on_limit_4_colors_per_tile_change(x, quantize_state):
+    quantize_state = x
+    return x
+
+
+def on_use_tile_variance_click(x, use_tile_state):
+    use_tile_state = x
+    return x
+
+
 def create_gradio_interface():
     """Creates the Gradio interface."""
     with gr.Blocks() as demo:
+        # Define state variables inside the interface
+        original_width = gr.State(value=0)
+        original_height = gr.State(value=0)
+        quantize_for_GBC = gr.State(False)
+        use_tile_variance = gr.State(False)
+
         with gr.Row():
             with gr.Column():
                 with gr.Row():
@@ -915,42 +960,29 @@ def create_gradio_interface():
                 is_black_and_white.change(lambda x: gr.update(visible=x),
                                           inputs=[is_black_and_white], outputs=[black_and_white_threshold])
 
-                def on_limit_4_colors_per_tile_change(x):
-                    quantize_for_GBC.value = x
-                    return x
-
-                limit_4_colors_per_tile.change(on_limit_4_colors_per_tile_change, inputs=[limit_4_colors_per_tile],
+                limit_4_colors_per_tile.change(on_limit_4_colors_per_tile_change, inputs=[limit_4_colors_per_tile, quantize_for_GBC],
                                                outputs=[quantize_for_GBC])
 
-                def on_use_tile_variance_click(x):
-                    use_tile_variance.value = x
-                    return x
-
-                use_tile_variance_checkbox.change(on_use_tile_variance_click, inputs=[use_tile_variance_checkbox],
+                use_tile_variance_checkbox.change(on_use_tile_variance_click, inputs=[use_tile_variance_checkbox, use_tile_variance],
                                                   outputs=[use_tile_variance])
 
                 image_input.change(capture_original_dimensions,
                                    inputs=[image_input],
                                    outputs=[original_width, original_height, image_input])
 
-                def on_logo_resolution_click():
-                    return False, 160, 144
-
-                logo_resolution.click(on_logo_resolution_click,
+                logo_resolution.click(lambda: (False, 160, 144),
                                       outputs=[keep_aspect_ratio, new_width, new_height])
 
-                def on_original_resolution_click():
-                    return False, original_width.value, original_height.value
-
                 original_resolution.click(on_original_resolution_click,
+                                          inputs=[original_width, original_height],
                                           outputs=[keep_aspect_ratio, new_width, new_height])
 
                 keep_aspect_ratio.change(adjust_for_aspect_ratio,
-                                         inputs=[keep_aspect_ratio, new_width, new_height],
+                                         inputs=[keep_aspect_ratio, new_width, new_height, original_width, original_height],
                                          outputs=[new_width, new_height])
 
                 new_width.change(adjust_for_aspect_ratio,
-                                 inputs=[keep_aspect_ratio, new_width, new_height],
+                                 inputs=[keep_aspect_ratio, new_width, new_height, original_width, original_height],
                                  outputs=[new_width, new_height])
 
             with gr.Column():
@@ -983,13 +1015,15 @@ def create_gradio_interface():
         use_custom_palette.change(lambda x: gr.update(visible=x),
                                   inputs=[use_custom_palette], outputs=[palette_image])
 
+        # Pass state variables quantize_for_GBC and use_tile_variance to the processing functions
         execute_button.click(process_image,
                              inputs=[image_input, new_width, new_height, keep_aspect_ratio, enable_color_limit,
                                      number_of_colors, quantization_method, dither_method, use_custom_palette,
                                      palette_image, is_grayscale, is_black_and_white, black_and_white_threshold,
                                      reduce_tile_checkbox, reduce_tile_similarity_threshold, limit_4_colors_per_tile,
                                      enable_gothic_filter, brightness_threshold, dot_size, spacing, contrast_boost,
-                                     noise_factor, edge_enhance, apply_blur, irregular_shape, irregular_size],
+                                     noise_factor, edge_enhance, apply_blur, irregular_shape, irregular_size,
+                                     quantize_for_GBC, use_tile_variance],
                              outputs=[image_output, palette_text, image_output_no_palette, notice_text])
 
         execute_button_folder.click(process_image_folder,
@@ -998,8 +1032,8 @@ def create_gradio_interface():
                                             palette_image, is_grayscale, is_black_and_white, black_and_white_threshold,
                                             reduce_tile_checkbox, reduce_tile_similarity_threshold, limit_4_colors_per_tile,
                                             enable_gothic_filter, brightness_threshold, dot_size, spacing,
-                                            contrast_boost,
-                                            noise_factor, edge_enhance, apply_blur, irregular_shape, irregular_size],
+                                            contrast_boost, noise_factor, edge_enhance, apply_blur, irregular_shape,
+                                            irregular_size, quantize_for_GBC, use_tile_variance],
                                     outputs=[image_output_zip, palette_text, image_output_no_palette, notice_text])
 
     return demo

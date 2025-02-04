@@ -1,1 +1,0 @@
-it's removing/merging tiles by palette index with reduce_tiles_indexed but there's like 250 colours so indexes can be like 100, 5, 73 so won't be merged properly. I need an intermediary function that converts each tile in a 0,1,2,3 value system so as long as the pattern is the same, the actual indices dont matter
