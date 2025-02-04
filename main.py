@@ -18,6 +18,11 @@ from sklearn.cluster import KMeans
 from collections import Counter
 from scipy.spatial.distance import cdist  # For calculating distances between color sets
 import traceback
+from skimage.metrics import structural_similarity as ssim
+import numpy as np
+import concurrent.futures
+from concurrent.futures import ProcessPoolExecutor
+
 
 
 # Constants for dithering and quantization methods
@@ -336,10 +341,21 @@ def convert_to_rgb_with_four_colors(image: Image, target_colors: list):
             new_rgb_image.putpixel((x, y), color_mapping[index])
 
     return new_rgb_image
+def calculate_ssim(tile1, tile2):
+    """
+    Calculate the Structural Similarity Index (SSIM) between two tiles.
+    """
+    # Convert tiles to grayscale for SSIM calculation
+    tile1_gray = np.array(tile1.convert('L'))
+    tile2_gray = np.array(tile2.convert('L'))
+    
+    # Calculate SSIM. Ensure data_range matches the max of the data type.
+    score, _ = ssim(tile1_gray, tile2_gray, full=True, data_range=255)
+    return score
 def normalize_tile(tile):
     """
     Convert a tile to a normalized form based on the frequency of each color,
-    disregarding the specific colors themselves.
+    disregarding the specific colors themselves. The tile should already be in 'P' mode.
     """
     # In P mode, the data is already flat: a sequence of indices, not rows of pixels
     flat_tile = list(tile.getdata())
@@ -363,14 +379,23 @@ def tile_similarity_indexed(tile1, tile2):
     # Convert both tiles to their normalized forms
     norm_tile1 = normalize_tile(tile1)
     norm_tile2 = normalize_tile(tile2)
+    
     # Now compare the normalized tiles directly
     data1 = norm_tile1.getdata()
     data2 = norm_tile2.getdata()
+    
     # Measure similarity as the percentage of matching pixels
     matches = sum(1 for p1, p2 in zip(data1, data2) if p1 == p2)
     return matches / len(data1)
 
 def map_pattern_to_palette(source_tile, target_tile):
+    """
+    Maps the color pattern from the source tile to the target tile's palette.
+    
+    :param source_tile: The source tile (Image object) whose pattern will be used.
+    :param target_tile: The target tile (Image object) whose palette will be applied.
+    :return: A new tile with the source pattern and target palette.
+    """
     # Get the normalized form of the source tile to understand its pattern
     norm_source_tile = normalize_tile(source_tile)
     norm_source_data = list(norm_source_tile.getdata())
@@ -381,17 +406,76 @@ def map_pattern_to_palette(source_tile, target_tile):
     # Create a mapping from the normalized source pattern to the target's indexes
     pattern_to_color = {}
     for norm_val, target_val in zip(norm_source_data, target_data):
-        if norm_val not in pattern_to_color:  # if this pattern not yet mapped, map to current color in target
+        if norm_val not in pattern_to_color: # if this pattern not yet mapped, map to current color in target
             pattern_to_color[norm_val] = target_val
-
+            
     # Apply this mapping to create a new tile based on the source pattern but using target's color indexes
     new_tile_data = [pattern_to_color[norm_val] for norm_val in norm_source_data]
-
+    
     # Create a new image for the mapped tile
     new_tile = Image.new('P', target_tile.size)
     new_tile.putpalette(target_tile.getpalette())
     new_tile.putdata(new_tile_data)
     return new_tile
+    
+def reduce_tiles_index(image: Image, tile_size=8, max_unique_tiles=192, similarity_threshold=0.7, use_tile_variance=False, custom_palette_colors=None):
+    """
+    Reduces the number of unique tiles in an image based on similarity.
+    """
+    width, height = image.size
+    width -= width % tile_size
+    height -= height % tile_size
+    # convert to P mode perfectly with exactly same colour info
+    image = image.crop((0, 0, width, height)).convert('P', colors=256, dither=Image.NONE)
+
+    # Initialize variables
+    tiles = [(x, y, image.crop((x, y, x + tile_size, y + tile_size)))
+             for y in range(0, height, tile_size)
+             for x in range(0, width, tile_size)]
+
+    # Sort tiles by variance if required
+    if use_tile_variance:
+        tiles.sort(key=lambda x: tile_variance(x[2]))
+
+    unique_tiles = []
+    tile_mapping = {}
+    new_image = Image.new('P', (width, height)) # Use 'P' mode for the new image
+    image_palette = image.getpalette() # Get the palette of the original image
+    new_image.putpalette(image_palette)  # Apply the same palette to the new image
+
+    notice = ''
+    for x, y, tile in tiles:
+        best_similarity = -1
+        best_match = None
+        for unique_x, unique_y, unique_tile in unique_tiles:
+            sim = tile_similarity_indexed(tile, unique_tile) # Define or use a suitable function
+            if sim > best_similarity:
+                best_similarity = sim
+                best_match = (unique_x, unique_y, unique_tile)
+
+        if best_similarity > similarity_threshold:
+            tile_mapping[(x, y)] = (best_match[0], best_match[1])
+        elif len(unique_tiles) < max_unique_tiles:
+            unique_tiles.append((x, y, tile))
+            tile_mapping[(x, y)] = (x, y)
+        else:
+            best_match = min(unique_tiles, key=lambda ut: tile_similarity_indexed(tile, ut[2]))
+            tile_mapping[(x, y)] = (best_match[0], best_match[1])
+
+    # Paint the new image
+    for (x, y), (ux, uy) in tile_mapping.items():
+        original_tile = image.crop((x, y, x + tile_size, y + tile_size)) # Get the original tile
+        pattern_tile = image.crop((ux, uy, ux + tile_size, uy + tile_size)) # Get the tile to copy the pattern from
+        new_tile = map_pattern_to_palette(pattern_tile, original_tile) # Create a new tile with the original palette but new pattern
+        new_image.paste(new_tile, (x, y))
+
+    if len(unique_tiles) < max_unique_tiles:
+        notice = f"Unique tiles used: {len(unique_tiles)}/{max_unique_tiles}\nConsider increasing Tile Similarity Threshold."
+    else:
+        remaining_tiles = len(tiles) - len(unique_tiles)
+        notice += f"Out of spare tiles. Consider reducing Tile Similarity Threshold.\nRemaining tiles: {remaining_tiles}"
+
+    return new_image, notice
 
 
 def reduce_tiles_index(image: Image, tile_size=8, max_unique_tiles=192, similarity_threshold=0.7, use_tile_variance=False, custom_palette_colors=None):
@@ -887,47 +971,34 @@ def create_gradio_interface():
         import numpy as np
 
         from skimage.color import deltaE_ciede2000
+        from skimage.color import rgb2lab, lab2rgb
         from skimage import color  # Import the color module from scikit-image
-        def apply_palette(tile, palette, dither=False):
-            # Convert the PIL Image to a NumPy array
-            tile_data = np.array(tile, dtype=np.uint8)
+        def apply_palette(tile, palette):
+            """
+            Applies a palette to a tile using vectorized operations for efficiency.
+            """
+            tile_array = np.array(tile)
+            palette_array = np.array(palette)
 
-            # Ensure the data is in the correct shape and type before converting to Lab space
-            tile_lab = color.rgb2lab(tile_data)  # Directly convert the RGB NumPy array to Lab
+            # Convert tile and palette to LAB color space
+            tile_lab = rgb2lab(tile_array)
+            palette_lab = rgb2lab(palette_array[np.newaxis, :, :])
 
-            # Convert the palette to a NumPy array and then to Lab space
-            palette = np.array(palette, dtype=np.uint8)  # Ensure it's a NumPy array
-            palette_lab = color.rgb2lab(palette.reshape((1, 4, 3))).reshape(
-                (4, 3))  # Reshape for conversion and then back
+            # Expand dimensions for broadcasting
+            tile_lab_expanded = tile_lab[:, :, np.newaxis, :]
 
-            # Prepare the new tile data
-            new_tile_data = np.zeros_like(tile_data)
+            # Calculate color distances in a vectorized manner
+            distances = np.linalg.norm(tile_lab_expanded - palette_lab, axis=3)
 
-            # Map each original color in the tile to the closest color in the palette
-            for i in range(tile_data.shape[0]):  # Iterate over rows
-                for j in range(tile_data.shape[1]):  # Iterate over columns
-                    original_color_lab = tile_lab[i, j]
-                    distances = np.linalg.norm(palette_lab - original_color_lab, axis=1)
-                    closest_palette_index = np.argmin(distances)
-                    # Assign the closest color from the palette back in RGB space
-                    new_tile_data[i, j] = palette[closest_palette_index]
+            # Find the index of the closest palette color for each pixel
+            closest_palette_indices = np.argmin(distances, axis=2)
 
-                    # Apply dithering if enabled
-                    if dither:
-                        error = original_color_lab - palette_lab[closest_palette_index]
-                        # Distribute errors to neighboring pixels based on a simplified Floyd-Steinberg matrix
-                        if j + 1 < tile_data.shape[1]:
-                            tile_lab[i, j + 1] += error * 7 / 16
-                        if i + 1 < tile_data.shape[0]:
-                            if j > 0:
-                                tile_lab[i + 1, j - 1] += error * 3 / 16
-                            tile_lab[i + 1, j] += error * 5 / 16
-                            if j + 1 < tile_data.shape[1]:
-                                tile_lab[i + 1, j + 1] += error * 1 / 16
+            # Map the tile to the new palette using advanced indexing
+            new_tile_array = palette_array[closest_palette_indices]
 
-            # Convert the updated NumPy array back to a PIL Image
-            new_tile_image = Image.fromarray(new_tile_data, 'RGB')
-            return new_tile_image
+            # Convert back to PIL Image
+            new_tile = Image.fromarray(np.uint8(new_tile_array), 'RGB')
+            return new_tile
 
         from skimage.color import rgb2lab, lab2rgb
         from sklearn.cluster import MiniBatchKMeans
@@ -1120,7 +1191,7 @@ def create_gradio_interface():
                 tile_palette_mapping.append(closest_palette_index)
 
             # Step 3: Apply the selected palettes to each tile
-            processed_tiles = [apply_palette(tiles[i], enhanced_palettes[tile_palettes[i]], dither=should_dither) for i in range(len(tiles))]
+            processed_tiles = [apply_palette(tiles[i], enhanced_palettes[tile_palettes[i]]) for i in range(len(tiles))]
 
             return processed_tiles, enhanced_palettes, palette_for_tile_text, tile_palette_mapping
 
