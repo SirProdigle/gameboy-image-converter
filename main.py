@@ -4,7 +4,7 @@ from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
 import numpy as np
 from scipy.spatial import cKDTree
 from sklearn.cluster import KMeans
-from skimage.color import rgb2lab, lab2rgb
+from skimage.color import rgb2lab, lab2rgb, deltaE_cie76
 import random
 import os
 import zipfile
@@ -31,35 +31,39 @@ QUANTIZATION_METHODS = {
 
 # Utility Functions
 def tile_variance(tile):
-    """Compute the variance of a tile."""
-    arr = np.array(tile)
-    return np.std(arr, axis=(0, 1)).mean()
+    """Compute the variance of a tile based on luminance."""
+    if tile.mode == 'RGB':
+        arr = np.array(tile.convert('L'))  # Convert to grayscale for luminance
+    else:
+        arr = np.array(tile)
+    return np.var(arr)
 
 def tile_similarity(tile1, tile2):
-    """Calculate the Hamming similarity between two tiles."""
-    arr1 = np.array(tile1).flatten()
-    arr2 = np.array(tile2).flatten()
-    hamming_distance = np.sum(arr1 != arr2)
-    return 1 - (hamming_distance / arr1.size)
+    """Calculate the Euclidean similarity between two tiles in LAB color space."""
+    arr1 = np.array(tile1.convert('LAB')).flatten()
+    arr2 = np.array(tile2.convert('LAB')).flatten()
+    euclidean_distance = np.linalg.norm(arr1 - arr2)
+    max_distance = np.sqrt(3 * (255 ** 2))  # Maximum possible distance in LAB
+    return 1 - (euclidean_distance / max_distance)
 
 def dominant_color(tile):
     """
     Find the dominant color in a tile.
-    For grayscale, returns the most common value as a tuple.
-    For RGB, returns the most common RGB tuple.
     """
     arr = np.array(tile)
-    if len(arr.shape) == 2:
-        # Grayscale image
-        unique, counts = np.unique(arr, return_counts=True)
-        dominant = unique[np.argmax(counts)]
-        return (dominant,) * 3
-    elif len(arr.shape) == 3:
-        # Color image
-        unique, counts = np.unique(arr.reshape(-1, 3), axis=0, return_counts=True)
-        return tuple(unique[np.argmax(counts)])
+    if arr.ndim == 2:
+        # Grayscale
+        values, counts = np.unique(arr, return_counts=True)
+    elif arr.ndim == 3:
+        # Color
+        values, counts = np.unique(arr.reshape(-1, arr.shape[-1]), axis=0, return_counts=True)
     else:
         raise ValueError("Unexpected image format!")
+    dominant = values[np.argmax(counts)]
+    if arr.ndim == 2:
+        return (int(dominant),) * 3
+    else:
+        return tuple(dominant.astype(int))
 
 # Gothic Filter
 def apply_gothic_filter(image, threshold, dot_size, spacing, contrast_boost=1.5, edge_enhance=True, noise_factor=0.1,
@@ -378,11 +382,15 @@ def generate_palette(tile, num_colors=4):
     """Generate a palette for a tile using K-means clustering."""
     if not isinstance(tile, np.ndarray):
         tile = np.array(tile)
-    if tile.shape[0] * tile.shape[1] < num_colors:
-        raise ValueError("Tile is too small for the number of colors requested")
     data = tile.reshape((-1, 3))
-    kmeans = KMeans(n_clusters=num_colors, random_state=0, n_init=10).fit(data)
-    return kmeans.cluster_centers_.round().astype(int)
+    unique_colors = np.unique(data, axis=0)
+
+    if len(unique_colors) <= num_colors:
+        # If the tile has fewer unique colors than requested, use those colors directly
+        return unique_colors.round().astype(int)
+    else:
+        kmeans = KMeans(n_clusters=num_colors, random_state=0, n_init=10).fit(data)
+        return kmeans.cluster_centers_.round().astype(int)
 
 def get_color_distribution(tile):
     """Analyzes the tile and returns a frequency distribution of its colors."""
@@ -488,7 +496,10 @@ def create_refined_palettes(cluster_centers, tiles, num_palettes=8, colors_per_p
             break
 
     def color_distance(c1, c2):
-        return np.sqrt(np.sum((c1 - c2) ** 2))
+        """Calculates the CIELAB Delta E (1976) distance between two colors."""
+        c1_lab = rgb2lab(np.array(c1).reshape(1, 1, 3) / 255)
+        c2_lab = rgb2lab(np.array(c2).reshape(1, 1, 3) / 255)
+        return deltaE_cie76(c1_lab, c2_lab)[0, 0]
 
     global_color_usage = {tuple(color): 0 for color in cluster_centers_rgb}
     for palette in refined_palettes_rgb:
