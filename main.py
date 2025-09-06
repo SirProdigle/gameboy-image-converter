@@ -1138,7 +1138,8 @@ def create_gradio_interface():
                 weighted_colors = broad_palette_lab
 
             # Perform final KMeans clustering to determine refined palettes
-            final_kmeans = MiniBatchKMeans(n_clusters=max_colors, random_state=42)
+            # Cap colors at max_palettes * 4 to ensure GB Studio compatibility (8 palettes × 4 colors = 32 max)
+            final_kmeans = MiniBatchKMeans(n_clusters=min(max_colors, max_palettes * 4), random_state=42)
             final_kmeans.fit(weighted_colors)
 
             # Construct refined palettes
@@ -1357,7 +1358,7 @@ def create_gradio_interface():
                     # just keep the tuple colours
                     for i in range(len(custom_palette_info)):
                         custom_palette_info[i] = custom_palette_info[i][1]
-                    enhanced_palettes = analyze_and_construct_palettes(extract_tiles(image), max_palettes=8, max_colors=num_colors)
+                    enhanced_palettes = analyze_and_construct_palettes(extract_tiles(image), max_palettes=8, max_colors=min(num_colors, 32))
                     image, notice = reduce_tiles_index(image, similarity_threshold=reduce_tile_threshold, custom_palette_colors=custom_palette_info)
                     image = image.convert("RGB")
                     tiles = extract_tiles(image)
