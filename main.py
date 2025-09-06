@@ -417,7 +417,77 @@ def map_pattern_to_palette(source_tile, target_tile):
     new_tile.putpalette(target_tile.getpalette())
     new_tile.putdata(new_tile_data)
     return new_tile
+
+def reduce_tiles_index_palette_aware(image: Image, enhanced_palettes=None, tile_palette_mapping=None, tile_size=8, max_unique_tiles=192, similarity_threshold=0.7, use_tile_variance=False, custom_palette_colors=None):
+    """
+    Palette-aware tile reduction that preserves palette assignments while enforcing tile limits.
+    Only merges tiles that are both visually similar AND use the same palette.
+    """
+    width, height = image.size
+    width -= width % tile_size
+    height -= height % tile_size
+    image = image.crop((0, 0, width, height))
+
+    # Initialize variables
+    tiles = [(x, y, image.crop((x, y, x + tile_size, y + tile_size)))
+             for y in range(0, height, tile_size)
+             for x in range(0, width, tile_size)]
+
+    # Sort tiles by variance if required
+    if use_tile_variance:
+        tiles.sort(key=lambda x: tile_variance(x[2]))
+
+    unique_tiles = []  # Store (x, y, tile, palette_id)
+    tile_mapping = {}
+    new_image = Image.new('RGB', (width, height))
+
+    notice = ''
+    tiles_per_row = width // tile_size
     
+    for i, (x, y, tile) in enumerate(tiles):
+        # Determine palette ID for this tile position
+        palette_id = tile_palette_mapping[i] if tile_palette_mapping and i < len(tile_palette_mapping) else 0
+        
+        best_similarity = -1
+        best_match = None
+        
+        # Only compare with tiles that use the SAME palette
+        for unique_x, unique_y, unique_tile, unique_palette_id in unique_tiles:
+            if palette_id == unique_palette_id:  # Same palette requirement
+                sim = tile_similarity_indexed(tile.convert('P'), unique_tile.convert('P'))
+                if sim > best_similarity:
+                    best_similarity = sim
+                    best_match = (unique_x, unique_y, unique_tile, unique_palette_id)
+
+        if best_similarity > similarity_threshold:
+            tile_mapping[(x, y)] = (best_match[0], best_match[1])
+        elif len(unique_tiles) < max_unique_tiles:
+            unique_tiles.append((x, y, tile, palette_id))
+            tile_mapping[(x, y)] = (x, y)
+        else:
+            # Find best match among tiles with same palette, even if below threshold
+            same_palette_tiles = [(ux, uy, ut, up) for ux, uy, ut, up in unique_tiles if up == palette_id]
+            if same_palette_tiles:
+                best_match = min(same_palette_tiles, key=lambda ut: tile_similarity_indexed(tile.convert('P'), ut[2].convert('P')))
+                tile_mapping[(x, y)] = (best_match[0], best_match[1])
+            else:
+                # Force match with any tile (this shouldn't happen often)
+                best_match = min(unique_tiles, key=lambda ut: tile_similarity_indexed(tile.convert('P'), ut[2].convert('P')))
+                tile_mapping[(x, y)] = (best_match[0], best_match[1])
+
+    # Paint the new image
+    for (x, y), (ux, uy) in tile_mapping.items():
+        original_tile = image.crop((ux, uy, ux + tile_size, uy + tile_size))
+        new_image.paste(original_tile, (x, y))
+
+    if len(unique_tiles) < max_unique_tiles:
+        notice = f"✅ {len(unique_tiles)}/{max_unique_tiles} tiles used. You have {max_unique_tiles - len(unique_tiles)} tiles to spare!"
+    else:
+        notice = f"⚠️ Hit {max_unique_tiles} tile limit! Try: Lower similarity threshold • Use simpler images • Reduce colors • Increase image compression"
+
+    return new_image, notice
+
+
 def reduce_tiles_index(image: Image, tile_size=8, max_unique_tiles=192, similarity_threshold=0.7, use_tile_variance=False, custom_palette_colors=None):
     """
     Reduces the number of unique tiles in an image based on similarity.
@@ -470,10 +540,9 @@ def reduce_tiles_index(image: Image, tile_size=8, max_unique_tiles=192, similari
         new_image.paste(new_tile, (x, y))
 
     if len(unique_tiles) < max_unique_tiles:
-        notice = f"Unique tiles used: {len(unique_tiles)}/{max_unique_tiles}\nConsider increasing Tile Similarity Threshold."
+        notice = f"✅ {len(unique_tiles)}/{max_unique_tiles} tiles used. Try raising similarity threshold to save more tiles!"
     else:
-        remaining_tiles = len(tiles) - len(unique_tiles)
-        notice += f"Out of spare tiles. Consider reducing Tile Similarity Threshold.\nRemaining tiles: {remaining_tiles}"
+        notice = f"⚠️ Hit {max_unique_tiles} tile limit! Try: Lower similarity threshold • Use simpler images • Reduce detail/noise"
 
     return new_image, notice
 
@@ -529,10 +598,9 @@ def reduce_tiles_index(image: Image, tile_size=8, max_unique_tiles=192, similari
         new_image.paste(new_tile, (x, y))
 
     if len(unique_tiles) < max_unique_tiles:
-        notice = f"Unique tiles used: {len(unique_tiles)}/{max_unique_tiles}\nConsider increasing Tile Similarity Threshold."
+        notice = f"✅ {len(unique_tiles)}/{max_unique_tiles} tiles used. Try raising similarity threshold to save more tiles!"
     else:
-        remaining_tiles = len(tiles) - len(unique_tiles)
-        notice += f"Out of spare tiles. Consider reducing Tile Similarity Threshold.\nRemaining tiles: {remaining_tiles}"
+        notice = f"⚠️ Hit {max_unique_tiles} tile limit! Try: Lower similarity threshold • Use simpler images • Reduce detail/noise"
 
     return new_image, notice
 
@@ -621,8 +689,7 @@ def reduce_tiles(image, tile_size=8, max_unique_tiles=192, similarity_threshold=
         new_image.paste(tile, (x, y))  # Directly pasting the tile without color adjustment
 
     if not notice:
-        notice = (f"Unique tiles used : {len(unique_tiles)}/{max_unique_tiles}\n"
-                  f"Consider increasing Tile Similarity Threshold.")
+        notice = f"✅ {len(unique_tiles)}/{max_unique_tiles} tiles used. Try raising similarity threshold to save more tiles!"
     return new_image, notice if notice else None
 
 
@@ -1359,7 +1426,8 @@ def create_gradio_interface():
                     for i in range(len(custom_palette_info)):
                         custom_palette_info[i] = custom_palette_info[i][1]
                     enhanced_palettes = analyze_and_construct_palettes(extract_tiles(image), max_palettes=8, max_colors=min(num_colors, 32))
-                    image, notice = reduce_tiles_index(image, similarity_threshold=reduce_tile_threshold, custom_palette_colors=custom_palette_info)
+                    # REMOVED: Early tile reduction - moved to after all palette processing
+                    # image, notice = reduce_tiles_index(image, similarity_threshold=reduce_tile_threshold, custom_palette_colors=custom_palette_info)
                     image = image.convert("RGB")
                     tiles = extract_tiles(image)
                     processed_tiles, enhanced_palettes, text_for_palette_tile_application, tile_palette_mapping = process_tiles(tiles,8,8,8, image_for_reference_palette.width, len(image.getcolors()), enhanced_palettes=enhanced_palettes)
@@ -1382,6 +1450,15 @@ def create_gradio_interface():
                         for palette in enhanced_palettes:
                             palette_color_values.append(
                                 [f"#{color[0]:02x}{color[1]:02x}{color[2]:02x}" for color in palette])
+                    
+                    # MOVED: Apply palette-aware tile reduction AFTER all palette processing is complete
+                    # This prevents palette changes from creating new tiles that exceed the limit
+                    # Uses palette awareness to preserve color assignments while enforcing tile limits
+                    image, notice = reduce_tiles_index_palette_aware(image, enhanced_palettes=enhanced_palettes, 
+                                                                   tile_palette_mapping=tile_palette_mapping,
+                                                                   similarity_threshold=reduce_tile_threshold, 
+                                                                   custom_palette_colors=custom_palette_info)
+                    image = image.convert("RGB")
                 elif reduce_tile_flag:
                     image, notice = reduce_tiles(image, similarity_threshold=reduce_tile_threshold)
                     image_for_reference_palette, notice = reduce_tiles_index(image_for_reference_palette, similarity_threshold=reduce_tile_threshold)
