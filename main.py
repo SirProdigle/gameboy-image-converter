@@ -767,7 +767,7 @@ def adjust_for_aspect_ratio(keep_aspect, current_width, current_height):
 
 
 def create_gradio_interface():
-    header = '<script async defer data-website-id="f5b8324e-09b2-4d56-8c1f-40a1f1457023" src="https://metrics.prodigle.dev/umami.js"></script><script type="module" data-entity="gameboy-image-conveter" src="https://analytics.prodigle.dev/script.js"></script>'
+    header = '<script async defer data-website-id="f5b8324e-09b2-4d56-8c1f-40a1f1457023" src="https://metrics.prodigle.dev/umami.js"></script><script type="module" data-entity="gameboy-image-converter" src="https://analytics.prodigle.dev/script.js"></script>'
     with gr.Blocks(head=header) as demo:
         with gr.Row():
             with gr.Column():
