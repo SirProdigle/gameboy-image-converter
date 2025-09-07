@@ -1380,11 +1380,11 @@ def create_gradio_interface():
                 text_for_palette_tile_application = ""
                 if image.mode != "RGB":
                     image = image.convert("RGB")
-                    image = downscale_image(image, int(width), int(height), aspect_ratio)
-                    notice = None
-                    image_for_reference_palette = None
-                    base_image: Image = image.copy()
-                    if color_limit:
+                image = downscale_image(image, int(width), int(height), aspect_ratio)
+                notice = None
+                image_for_reference_palette = None
+                base_image: Image = image.copy()
+                if color_limit:
                     quant_method_key = quant_method if quant_method in QUANTIZATION_METHODS else 'Median cut'
                     dither_method_key = dither_method if dither_method in DITHER_METHODS else 'None'
 
@@ -1394,9 +1394,9 @@ def create_gradio_interface():
                                                                dither=DITHER_METHODS[dither_method_key])
                     image_for_reference_palette: Image = image_for_reference_palette.convert('RGB')
 
-                palette_color_values = []
-                enhanced_palettes = None
-                tile_palette_mapping = None
+                    palette_color_values = []
+                    enhanced_palettes = None
+                    tile_palette_mapping = None
                 if limit_4_colors_per_tile and not reduce_tile_flag:
                     image_for_reference_palette: Image = image.copy()
                     tiles = extract_tiles(image_for_reference_palette)
@@ -1525,19 +1525,15 @@ def create_gradio_interface():
                 if image_for_reference_palette.mode != "RGB":
                     image_for_reference_palette = image_for_reference_palette.convert("RGB")
 
+                # Additional processing for grayscale and black & white
+                if grayscale:
+                    image = convert_to_grayscale(image)
+                if black_and_white:
+                    image = convert_to_black_and_white(image, threshold=bw_threshold)
+                if reduce_tile_flag and not limit_4_colors_per_tile:
+                    image, notice = reduce_tiles(image, similarity_threshold=reduce_tile_threshold)
+                
                 return image, text_for_palette, image_for_reference_palette, notice
-
-            if grayscale:
-                image = convert_to_grayscale(image)
-            if black_and_white:
-                image = convert_to_black_and_white(image, threshold=bw_threshold)
-            if reduce_tile_flag:
-                image, notice = reduce_tiles(image, similarity_threshold=reduce_tile_threshold)
-            return (
-                image,
-                text_for_palette, None,
-                None
-            )
 
         def process_image_folder(input_files, width, height, aspect_ratio, color_limit, num_colors, quant_method, dither_method,
                                  use_palette, custom_palette, grayscale, black_and_white, bw_threshold, reduce_tile_flag,
