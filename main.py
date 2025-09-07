@@ -22,6 +22,10 @@ from skimage.metrics import structural_similarity as ssim
 import numpy as np
 import concurrent.futures
 from concurrent.futures import ProcessPoolExecutor
+import logging
+import json
+import uuid
+from contextlib import contextmanager
 
 
 
@@ -37,6 +41,45 @@ QUANTIZATION_METHODS = {
     "Fast octree": Image.Quantize.FASTOCTREE,
     "libimagequant": Image.Quantize.LIBIMAGEQUANT
 }
+
+# Structured logging setup
+logger = logging.getLogger("gradio_app")
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+logger.addHandler(handler)
+
+active_tasks = 0
+
+@contextmanager
+def task_log(task_type="image_convert"):
+    global active_tasks
+    task_id = str(uuid.uuid4())
+    start_time = time.time()
+    active_tasks += 1
+
+    logger.info(json.dumps({
+        "event": "task_start",
+        "task_id": task_id,
+        "task_type": task_type,
+        "timestamp": start_time,
+        "active_tasks": active_tasks,
+    }))
+
+    try:
+        yield task_id
+    finally:
+        end_time = time.time()
+        duration = end_time - start_time
+        active_tasks -= 1
+
+        logger.info(json.dumps({
+            "event": "task_finish",
+            "task_id": task_id,
+            "task_type": task_type,
+            "timestamp": end_time,
+            "duration": duration,
+            "active_tasks": active_tasks,
+        }))
 
 
 def tile_variance(tile):
@@ -1330,25 +1373,26 @@ def create_gradio_interface():
                           use_palette, custom_palette, grayscale, black_and_white, bw_threshold, reduce_tile_flag,
                           reduce_tile_threshold, limit_4_colors_per_tile, enable_gothic_filter, brightness_threshold, dot_size, spacing, contrast_boost,
                           noise_factor, edge_enhance, apply_blur, irregular_shape, irregular_size):
-            if num_colors <= 4:
-                limit_4_colors_per_tile = False
-            text_for_palette = ""
-            text_for_palette_tile_application = ""
-            if image.mode != "RGB":
-                image = image.convert("RGB")
-            image = downscale_image(image, int(width), int(height), aspect_ratio)
-            notice = None
-            image_for_reference_palette = None
-            base_image: Image = image.copy()
-            if color_limit:
-                quant_method_key = quant_method if quant_method in QUANTIZATION_METHODS else 'Median cut'
-                dither_method_key = dither_method if dither_method in DITHER_METHODS else 'None'
+            with task_log("process_image") as task_id:
+                if num_colors <= 4:
+                    limit_4_colors_per_tile = False
+                text_for_palette = ""
+                text_for_palette_tile_application = ""
+                if image.mode != "RGB":
+                    image = image.convert("RGB")
+                    image = downscale_image(image, int(width), int(height), aspect_ratio)
+                    notice = None
+                    image_for_reference_palette = None
+                    base_image: Image = image.copy()
+                    if color_limit:
+                    quant_method_key = quant_method if quant_method in QUANTIZATION_METHODS else 'Median cut'
+                    dither_method_key = dither_method if dither_method in DITHER_METHODS else 'None'
 
-                image_for_reference_palette: Image = image.copy()
-                image_for_reference_palette = limit_colors(image_for_reference_palette, limit=num_colors,
-                                                           quantize=QUANTIZATION_METHODS[quant_method_key],
-                                                           dither=DITHER_METHODS[dither_method_key])
-                image_for_reference_palette: Image = image_for_reference_palette.convert('RGB')
+                    image_for_reference_palette: Image = image.copy()
+                    image_for_reference_palette = limit_colors(image_for_reference_palette, limit=num_colors,
+                                                               quantize=QUANTIZATION_METHODS[quant_method_key],
+                                                               dither=DITHER_METHODS[dither_method_key])
+                    image_for_reference_palette: Image = image_for_reference_palette.convert('RGB')
 
                 palette_color_values = []
                 enhanced_palettes = None
@@ -1499,7 +1543,8 @@ def create_gradio_interface():
                                  use_palette, custom_palette, grayscale, black_and_white, bw_threshold, reduce_tile_flag,
                                     reduce_tile_threshold, limit_4_colors_per_tile, enable_gothic_filter, brightness_threshold, dot_size, spacing, contrast_boost,
                                  noise_factor, edge_enhance, apply_blur, irregular_shape, irregular_size):
-            folder_name = "output_" + str(random.randint(0, 100000))
+            with task_log("process_image_folder") as task_id:
+                folder_name = "output_" + str(random.randint(0, 100000))
             while os.path.exists(folder_name):
                 folder_name = "output_" + str(random.randint(0, 100000))
             os.makedirs(folder_name)
