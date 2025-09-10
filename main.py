@@ -1382,11 +1382,11 @@ def create_gradio_interface():
                     image = image.convert("RGB")
                 image = downscale_image(image, int(width), int(height), aspect_ratio)
                 notice = None
-                image_for_reference_palette = None
+                image_for_reference_palette = image.copy()
                 base_image: Image = image.copy()
+                quant_method_key = quant_method if quant_method in QUANTIZATION_METHODS else 'Median cut'
+                dither_method_key = dither_method if dither_method in DITHER_METHODS else 'None'
                 if color_limit:
-                    quant_method_key = quant_method if quant_method in QUANTIZATION_METHODS else 'Median cut'
-                    dither_method_key = dither_method if dither_method in DITHER_METHODS else 'None'
 
                     image_for_reference_palette: Image = image.copy()
                     image_for_reference_palette = limit_colors(image_for_reference_palette, limit=num_colors,
@@ -1414,6 +1414,8 @@ def create_gradio_interface():
                             [f"#{color[0]:02x}{color[1]:02x}{color[2]:02x}" for color in palette])
                 else:
                     palette_colors = image_for_reference_palette.getcolors(maxcolors=num_colors)
+                    if palette_colors is None:
+                        palette_colors = image_for_reference_palette.quantize(colors=num_colors).convert('RGB').getcolors(maxcolors=num_colors)
                     palette_colors = [color for count, color in palette_colors]
                     palette_color_values = [
                         "#{0:02x}{1:02x}{2:02x}".format(*color) for color in palette_colors
