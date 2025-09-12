@@ -4,15 +4,16 @@ FROM python:3.10
 # Set the working directory in the container
 WORKDIR /usr/src/app
 
-# Clone the required repository
-RUN apt-get update && apt-get install -y git \
-    && git clone https://github.com/SirProdigle/gameboy-image-converter.git .
+# Install system dependencies
+RUN apt-get update && apt-get install -y git
 
 # Install dependencies for building Python packages and libimagequant
 RUN apt-get install -y build-essential libimagequant-dev libjpeg-dev zlib1g-dev libfreetype6-dev liblcms2-dev libtiff5-dev tk-dev tcl-dev libwebp-dev libharfbuzz-dev libfribidi-dev libxcb1-dev libxml2-dev libxslt1-dev libexif-dev libraqm-dev
 
-# Install Python dependencies
+# Copy local files
 COPY requirements.txt ./
+COPY main.py ./
+COPY gb_palette.png ./
 RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install libimagequant
 
