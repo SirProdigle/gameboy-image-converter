@@ -583,12 +583,28 @@ def reduce_tiles_index(image: Image, tile_size=8, max_unique_tiles=192, similari
         new_image.paste(new_tile, (x, y))
 
     if len(unique_tiles) < max_unique_tiles:
-        notice = f"✅ {len(unique_tiles)}/{max_unique_tiles} tiles used. Try raising similarity threshold to save more tiles!"
+        notice = f"✅ {len(unique_tiles)}/{max_unique_tiles} tiles used."
     else:
         notice = f"⚠️ Hit {max_unique_tiles} tile limit! Try: Lower similarity threshold • Use simpler images • Reduce detail/noise"
 
     return new_image, notice
 
+
+def is_nearly_solid_tile(tile, tolerance=0.95):
+    """Check if a tile is mostly one color (95%+ pixels the same)"""
+    data = list(tile.getdata())
+    if not data:
+        return False
+    color_counts = Counter(data)
+    most_common_count = color_counts.most_common(1)[0][1]
+    return most_common_count / len(data) >= tolerance
+
+def create_solid_color_tile(tile_size, color_index, palette):
+    """Create a solid color tile with a specific palette index"""
+    solid_tile = Image.new('P', (tile_size, tile_size))
+    solid_tile.putpalette(palette)
+    solid_tile.putdata([color_index] * (tile_size * tile_size))
+    return solid_tile
 
 def reduce_tiles_index(image: Image, tile_size=8, max_unique_tiles=192, similarity_threshold=0.7, use_tile_variance=False, custom_palette_colors=None):
     width, height = image.size
@@ -612,22 +628,62 @@ def reduce_tiles_index(image: Image, tile_size=8, max_unique_tiles=192, similari
     new_image = Image.new('P', (width, height))  # Use 'P' mode for the new image
     image_palette = image.getpalette()  # Get the palette of the original image
     new_image.putpalette(image_palette)  # Apply the same palette to the new image
+    
+    # Add solid color reference tiles first (using negative coordinates to mark them as references)
+    # Get the most common colors in the image
+    color_counts = image.getcolors(width * height)
+    if color_counts:
+        # Sort by frequency and take top 4-8 colors for solid references
+        top_colors = sorted(color_counts, key=lambda x: x[0], reverse=True)[:min(8, len(color_counts))]
+        for i, (count, color_idx) in enumerate(top_colors):
+            solid_tile = create_solid_color_tile(tile_size, color_idx, image_palette)
+            # Use negative coordinates to indicate reference tiles
+            unique_tiles.append((-(i+1)*tile_size, -(i+1)*tile_size, solid_tile))
 
     notice = ''
     for x, y, tile in tiles:
+        # Check if this tile is nearly solid
+        tile_is_nearly_solid = is_nearly_solid_tile(tile, tolerance=0.95)
+        
         best_similarity = -1
         best_match = None
+        best_is_solid_ref = False
+        
         for unique_x, unique_y, unique_tile in unique_tiles:
-            sim = tile_similarity_indexed(tile, unique_tile)  # Define or use a suitable function
+            # Check if the unique tile is a solid reference (negative coordinates)
+            is_solid_ref = unique_x < 0 and unique_y < 0
+            
+            sim = tile_similarity_indexed(tile, unique_tile)
+            
+            # If current tile is nearly solid and we're comparing to a solid reference,
+            # boost the similarity score to prefer solid matches
+            if tile_is_nearly_solid and is_solid_ref:
+                sim = sim * 1.1  # Boost similarity for solid-to-solid matches
+            
             if sim > best_similarity:
                 best_similarity = sim
                 best_match = (unique_x, unique_y, unique_tile)
+                best_is_solid_ref = is_solid_ref
 
-        if best_similarity > similarity_threshold:
+        # For nearly solid tiles, use a higher threshold to prefer solid references
+        effective_threshold = similarity_threshold
+        if tile_is_nearly_solid and best_is_solid_ref:
+            effective_threshold = similarity_threshold * 0.9  # Lower threshold for solid matches
+        
+        if best_similarity > effective_threshold:
             tile_mapping[(x, y)] = (best_match[0], best_match[1])
         elif len(unique_tiles) < max_unique_tiles:
-            unique_tiles.append((x, y, tile))
-            tile_mapping[(x, y)] = (x, y)
+            # Only add non-solid tiles with single pixel differences if they have meaningful variance
+            if not tile_is_nearly_solid or tile_variance(tile) > 0.5:
+                unique_tiles.append((x, y, tile))
+                tile_mapping[(x, y)] = (x, y)
+            else:
+                # Nearly solid tile - map to best solid reference instead
+                if best_match:
+                    tile_mapping[(x, y)] = (best_match[0], best_match[1])
+                else:
+                    unique_tiles.append((x, y, tile))
+                    tile_mapping[(x, y)] = (x, y)
         else:
             best_match = min(unique_tiles, key=lambda ut: tile_similarity_indexed(tile, ut[2]))
             tile_mapping[(x, y)] = (best_match[0], best_match[1])
@@ -635,13 +691,24 @@ def reduce_tiles_index(image: Image, tile_size=8, max_unique_tiles=192, similari
     # Paint the new image
     for (x, y), (ux, uy) in tile_mapping.items():
         original_tile = image.crop((x, y, x + tile_size, y + tile_size))  # Get the original tile
-        pattern_tile = image.crop((ux, uy, ux + tile_size, uy + tile_size))  # Get the tile to copy the pattern from
-        new_tile = map_pattern_to_palette(pattern_tile,
-                                          original_tile)  # Create a new tile with the original palette but new pattern
+        
+        # Check if we're using a reference tile (negative coordinates)
+        if ux < 0 and uy < 0:
+            # Find the reference tile in unique_tiles
+            ref_tile = next((ut for ux2, uy2, ut in unique_tiles if ux2 == ux and uy2 == uy), None)
+            if ref_tile:
+                # For solid reference tiles, just use them directly
+                new_tile = map_pattern_to_palette(ref_tile, original_tile)
+            else:
+                new_tile = original_tile
+        else:
+            pattern_tile = image.crop((ux, uy, ux + tile_size, uy + tile_size))  # Get the tile to copy the pattern from
+            new_tile = map_pattern_to_palette(pattern_tile,
+                                              original_tile)  # Create a new tile with the original palette but new pattern
         new_image.paste(new_tile, (x, y))
 
     if len(unique_tiles) < max_unique_tiles:
-        notice = f"✅ {len(unique_tiles)}/{max_unique_tiles} tiles used. Try raising similarity threshold to save more tiles!"
+        notice = f"✅ {len(unique_tiles)}/{max_unique_tiles} tiles used. Try raising similarity threshold to get more details!"
     else:
         notice = f"⚠️ Hit {max_unique_tiles} tile limit! Try: Lower similarity threshold • Use simpler images • Reduce detail/noise"
 
