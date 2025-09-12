@@ -1532,8 +1532,6 @@ def create_gradio_interface():
                     image = convert_to_grayscale(image)
                 if black_and_white:
                     image = convert_to_black_and_white(image, threshold=bw_threshold)
-                if reduce_tile_flag and not limit_4_colors_per_tile:
-                    image, notice = reduce_tiles(image, similarity_threshold=reduce_tile_threshold)
                 
                 return image, text_for_palette, image_for_reference_palette, notice
 
