@@ -1,7 +1,7 @@
 # 🖼️ Gameboy Image Converter
 
 [![Made with Python](https://img.shields.io/badge/Made%20with-Python-1f425f.svg)](https://www.python.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: AGPL](https://img.shields.io/badge/License-AGPL-yellow.svg)](https://opensource.org/licenses/AGPL)
 
 An powerful and versatile image processing tool with a user-friendly Gradio interface. Perfect for game developers, digital artists, and retro enthusiasts!
 
@@ -9,7 +9,7 @@ An powerful and versatile image processing tool with a user-friendly Gradio inte
 
 - 🎨 Color palette reduction and custom palette application
 - 🧩 Tile-based image processing for retro game development
-- 🖋️ Gothic filter for unique artistic effects
+- 🖋️ Gothic filter for unique artistic effectsz
 - 📐 Image resizing with aspect ratio preservation
 - 🔄 Batch processing for multiple images
 - 🎮 Specialized features for Game Boy-style graphics
