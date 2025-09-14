@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git init:*)",
+      "Bash(git remote add:*)",
+      "Bash(git branch:*)",
+      "Bash(git fetch:*)",
+      "Bash(git reset:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(docker build:*)",
+      "Bash(docker tag:*)",
+      "Bash(docker push:*)",
+      "Bash(python:*)",
+      "Bash(netstat:*)",
+      "Bash(lsof:*)",
+      "Bash(xargs kill:*)",
+      "Bash(sudo netstat:*)",
+      "Bash(ss -tlnp)",
+      "Bash(readlink:*)",
+      "Bash(kill:*)",
+      "Bash(curl:*)",
+      "WebFetch(domain:hub.docker.com)",
+      "Bash(docker search:*)",
+      "Bash(docker login:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
