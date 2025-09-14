@@ -82,7 +82,7 @@ Contributions, issues, and feature requests are welcome! Feel free to check [iss
 
 ## 📜 License
 
-This project is [MIT](https://opensource.org/licenses/MIT) licensed.
+This project is [AGPL](https://opensource.org/licenses/AGPL) licensed.
 
 ## 🙏 Acknowledgements
 
