@@ -17,10 +17,10 @@ COPY gb_palette.png ./
 RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install libimagequant
 
-# Install Pillow with libimagequant enabled
+# Install Pillow with libimagequant enabled (keep version 10.4.0 for Gradio compatibility)
 RUN pip uninstall Pillow -y
 RUN python -m pip cache purge
-RUN CFLAGS="-I/usr/include" LDFLAGS="-L/usr/lib" python -m pip install --upgrade Pillow --no-cache-dir --no-binary :all:
+RUN CFLAGS="-I/usr/include" LDFLAGS="-L/usr/lib" python -m pip install Pillow==10.4.0 --no-cache-dir --no-binary :all:
 
 # Make port 80 available to the world outside this container
 # EXPOSE 80

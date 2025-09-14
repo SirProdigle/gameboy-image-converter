@@ -23,7 +23,8 @@
       "Bash(curl:*)",
       "WebFetch(domain:hub.docker.com)",
       "Bash(docker search:*)",
-      "Bash(docker login:*)"
+      "Bash(docker login:*)",
+      "Bash(pip show:*)"
     ],
     "deny": [],
     "ask": []
