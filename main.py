@@ -26,6 +26,10 @@ import logging
 import json
 import uuid
 from contextlib import contextmanager
+from pathlib import Path
+from typing import Callable, Optional
+
+from monitoring import HeartbeatMonitor, QueueClearedError, TaskExecutor, TaskMetrics
 
 
 
@@ -48,6 +52,20 @@ logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
 logger.addHandler(handler)
 
+HEARTBEAT_WEBHOOK_URL = os.environ.get(
+    "HEARTBEAT_WEBHOOK_URL",
+    "https://canary.discord.com/api/webhooks/1425053965934137449/p_K0PCtdgM8uuZw34VxCXBr7NKZdkQVgmj-mJfZDqHim4irOuibcLfUFLI3J2_KWVYJb",
+)
+HEARTBEAT_MESSAGE_FILE = Path("heartbeat_status.json")
+HEARTBEAT_INTERVAL_SECONDS = 60
+QUEUE_ALERT_THRESHOLD = 15
+QUEUE_CLEAR_THRESHOLD = 50
+QUEUE_CLEAR_REASON = "Queue length exceeded safety limit"
+
+task_metrics = TaskMetrics()
+task_executor = TaskExecutor(task_metrics, max_workers=2)
+heartbeat_monitor: Optional[HeartbeatMonitor] = None
+
 active_tasks = 0
 
 @contextmanager
@@ -55,7 +73,10 @@ def task_log(task_type="image_convert"):
     global active_tasks
     task_id = str(uuid.uuid4())
     start_time = time.time()
+    success = True
+
     active_tasks += 1
+    task_metrics.task_started(task_id, task_type)
 
     logger.info(json.dumps({
         "event": "task_start",
@@ -67,10 +88,14 @@ def task_log(task_type="image_convert"):
 
     try:
         yield task_id
+    except Exception:
+        success = False
+        raise
     finally:
         end_time = time.time()
         duration = end_time - start_time
-        active_tasks -= 1
+        active_tasks = max(active_tasks - 1, 0)
+        task_metrics.task_finished(task_id, task_type, duration, success=success)
 
         logger.info(json.dumps({
             "event": "task_finish",
@@ -80,6 +105,33 @@ def task_log(task_type="image_convert"):
             "duration": duration,
             "active_tasks": active_tasks,
         }))
+
+
+def run_in_task_executor(fn: Callable):
+    def wrapper(*args, **kwargs):
+        snapshot = task_metrics.task_submitted()
+        queue_size = snapshot.queued_tasks
+        monitor = heartbeat_monitor
+        if monitor:
+            monitor.check_queue_threshold(queue_size)
+        if queue_size > QUEUE_CLEAR_THRESHOLD:
+            task_metrics.retract_submission()
+            cleared = task_executor.clear_pending(QUEUE_CLEAR_REASON)
+            if monitor and cleared:
+                monitor.record_queue_cleared(
+                    cleared,
+                    f"{QUEUE_CLEAR_REASON} (dropped {cleared} task(s))",
+                )
+            raise gr.Error(
+                f"System queue was cleared after exceeding {QUEUE_CLEAR_THRESHOLD} pending tasks. Please retry shortly."
+            )
+        future = task_executor.submit(fn, *args, **kwargs)
+        try:
+            return future.result()
+        except QueueClearedError as exc:
+            raise gr.Error(str(exc)) from None
+
+    return wrapper
 
 
 def tile_variance(tile):
@@ -1644,7 +1696,7 @@ def create_gradio_interface():
                 print(traceback.format_exc())
                 return None, "Error processing folder " + str(e), None, None
 
-        execute_button.click(process_image,
+        execute_button.click(run_in_task_executor(process_image),
                              inputs=[image_input, new_width, new_height, keep_aspect_ratio, enable_color_limit,
                                      number_of_colors, quantization_method, dither_method, use_custom_palette,
                                      palette_image, is_grayscale, is_black_and_white, black_and_white_threshold,
@@ -1655,7 +1707,7 @@ def create_gradio_interface():
                              outputs=[image_output, palette_text,
                                       image_output_no_palette, notice_text])
 
-        execute_button_folder.click(process_image_folder,
+        execute_button_folder.click(run_in_task_executor(process_image_folder),
                                     inputs=[folder_input, new_width, new_height, keep_aspect_ratio, enable_color_limit,
                                             number_of_colors, quantization_method, dither_method, use_custom_palette,
                                             palette_image, is_grayscale, is_black_and_white, black_and_white_threshold,
@@ -1692,6 +1744,17 @@ if __name__ == "__main__":
     interval = 60
     # clear temporary files every 60 seconds
     start_clearing_temporary_files_timer(interval)
+    if HEARTBEAT_WEBHOOK_URL:
+        heartbeat_monitor = HeartbeatMonitor(
+            metrics=task_metrics,
+            webhook_url=HEARTBEAT_WEBHOOK_URL,
+            message_store=HEARTBEAT_MESSAGE_FILE,
+            interval_seconds=HEARTBEAT_INTERVAL_SECONDS,
+            queue_alert_threshold=QUEUE_ALERT_THRESHOLD,
+        )
+        heartbeat_monitor.start()
+    else:
+        logger.warning("Heartbeat monitor disabled because HEARTBEAT_WEBHOOK_URL is not set")
     demo: gr.Blocks = create_gradio_interface()
     # use http basic auth with password of boobiess
     demo.launch(share=False, server_name="0.0.0.0", server_port=7860)
