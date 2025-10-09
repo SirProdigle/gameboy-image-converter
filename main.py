@@ -57,7 +57,7 @@ HEARTBEAT_WEBHOOK_URL = os.environ.get(
     "https://canary.discord.com/api/webhooks/1425053965934137449/p_K0PCtdgM8uuZw34VxCXBr7NKZdkQVgmj-mJfZDqHim4irOuibcLfUFLI3J2_KWVYJb",
 )
 HEARTBEAT_MESSAGE_FILE = Path("heartbeat_status.json")
-HEARTBEAT_INTERVAL_SECONDS = 60
+HEARTBEAT_INTERVAL_SECONDS = 10
 QUEUE_ALERT_THRESHOLD = 15
 QUEUE_CLEAR_THRESHOLD = 50
 QUEUE_CLEAR_REASON = "Queue length exceeded safety limit"

@@ -173,19 +173,35 @@ class DiscordWebhookClient:
         self._base_url = webhook_url.rstrip("/")
         self._timeout = timeout
 
-    def send_message(self, content: str, embeds: Optional[list] = None, allowed_mentions: Optional[dict] = None) -> Optional[dict]:
+    def send_message(
+        self,
+        content: str,
+        embeds: Optional[list] = None,
+        allowed_mentions: Optional[dict] = None,
+    ) -> Optional[dict]:
         payload: Dict[str, Any] = {"content": content}
         if embeds:
             payload["embeds"] = embeds
         if allowed_mentions is not None:
             payload["allowed_mentions"] = allowed_mentions
         try:
-            response = requests.post(self._base_url, json=payload, timeout=self._timeout)
+            response = requests.post(
+                self._base_url,
+                json=payload,
+                params={"wait": "true"},
+                timeout=self._timeout,
+            )
             response.raise_for_status()
         except requests.RequestException:
             logger.exception("Failed to send Discord webhook message")
             return None
-        return response.json()
+        if not response.content:
+            return {}
+        try:
+            return response.json()
+        except ValueError:
+            logger.warning("Discord webhook response did not contain JSON payload")
+            return {}
 
     def edit_message(self, message_id: str, content: str, embeds: Optional[list] = None) -> Optional[dict]:
         url = f"{self._base_url}/messages/{message_id}"
@@ -193,12 +209,23 @@ class DiscordWebhookClient:
         if embeds:
             payload["embeds"] = embeds
         try:
-            response = requests.patch(url, json=payload, timeout=self._timeout)
+            response = requests.patch(
+                url,
+                json=payload,
+                params={"wait": "true"},
+                timeout=self._timeout,
+            )
             response.raise_for_status()
         except requests.RequestException:
             logger.exception("Failed to edit Discord webhook message")
             return None
-        return response.json()
+        if not response.content:
+            return {}
+        try:
+            return response.json()
+        except ValueError:
+            logger.warning("Discord edit response did not contain JSON payload")
+            return {}
 
     def delete_message(self, message_id: str) -> bool:
         url = f"{self._base_url}/messages/{message_id}"
@@ -266,7 +293,7 @@ class HeartbeatMonitor:
                 self._message_id = None
         if not self._message_id:
             response = self._webhook.send_message(content)
-            if response and "id" in response:
+            if response is not None and "id" in response:
                 self._message_id = response["id"]
                 self._save_message_id(self._message_id)
 
@@ -283,7 +310,7 @@ class HeartbeatMonitor:
             f"{self._queue_alert_threshold}."
         )
         response = self._webhook.send_message(content)
-        if response and "id" in response:
+        if response is not None and "id" in response:
             message_id = response["id"]
             self._queue_alert_id = message_id
             timer = threading.Timer(self._queue_alert_duration, self._delete_queue_alert, args=(message_id,))
