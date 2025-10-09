@@ -193,14 +193,14 @@ class DiscordWebhookClient:
             )
             response.raise_for_status()
         except requests.RequestException:
-            logger.exception("Failed to send Discord webhook message")
+            logger.debug("Discord webhook send failed; suppressing error", exc_info=True)
             return None
         if not response.content:
             return {}
         try:
             return response.json()
         except ValueError:
-            logger.warning("Discord webhook response did not contain JSON payload")
+            logger.debug("Discord webhook response missing JSON payload; ignoring", exc_info=True)
             return {}
 
     def edit_message(self, message_id: str, content: str, embeds: Optional[list] = None) -> Optional[dict]:
@@ -217,14 +217,14 @@ class DiscordWebhookClient:
             )
             response.raise_for_status()
         except requests.RequestException:
-            logger.exception("Failed to edit Discord webhook message")
+            logger.debug("Discord webhook edit failed; suppressing error", exc_info=True)
             return None
         if not response.content:
             return {}
         try:
             return response.json()
         except ValueError:
-            logger.warning("Discord edit response did not contain JSON payload")
+            logger.debug("Discord edit response missing JSON payload; ignoring", exc_info=True)
             return {}
 
     def delete_message(self, message_id: str) -> bool:
@@ -233,7 +233,7 @@ class DiscordWebhookClient:
             response = requests.delete(url, timeout=self._timeout)
             response.raise_for_status()
         except requests.RequestException:
-            logger.exception("Failed to delete Discord webhook message")
+            logger.debug("Discord webhook delete failed; suppressing error", exc_info=True)
             return False
         return True
 
@@ -281,21 +281,21 @@ class HeartbeatMonitor:
             try:
                 self.post_status()
             except Exception:
-                logger.exception("Unexpected error while posting heartbeat status")
+                logger.debug("Heartbeat status update failed; suppressing error", exc_info=True)
             self._stop_event.wait(self._interval)
 
     def post_status(self) -> None:
         snapshot = self._metrics.get_snapshot()
         content = self._format_status(snapshot)
+        if not self._message_id and self._message_store.exists():
+            self._message_id = self._load_message_id()
         if self._message_id:
-            response = self._webhook.edit_message(self._message_id, content)
-            if response is None:
-                self._message_id = None
-        if not self._message_id:
-            response = self._webhook.send_message(content)
-            if response is not None and "id" in response:
-                self._message_id = response["id"]
-                self._save_message_id(self._message_id)
+            self._webhook.edit_message(self._message_id, content)
+            return
+        response = self._webhook.send_message(content)
+        if response is not None and "id" in response:
+            self._message_id = response["id"]
+            self._save_message_id(self._message_id)
 
     def check_queue_threshold(self, queue_size: int) -> None:
         if queue_size <= self._queue_alert_threshold:
@@ -362,7 +362,7 @@ class HeartbeatMonitor:
             data = json.loads(self._message_store.read_text())
             return data.get("message_id")
         except Exception:
-            logger.exception("Failed to load heartbeat message id")
+            logger.debug("Failed to load heartbeat message id; suppressing error", exc_info=True)
             return None
 
     def _save_message_id(self, message_id: str) -> None:
@@ -370,4 +370,4 @@ class HeartbeatMonitor:
             self._message_store.parent.mkdir(parents=True, exist_ok=True)
             self._message_store.write_text(json.dumps({"message_id": message_id}))
         except Exception:
-            logger.exception("Failed to persist heartbeat message id")
+            logger.debug("Failed to persist heartbeat message id; suppressing error", exc_info=True)
