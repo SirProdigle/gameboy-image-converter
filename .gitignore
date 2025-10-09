@@ -3,3 +3,5 @@
 venv
 venv/*
 .idea/
+
+heartbeat_status.json
