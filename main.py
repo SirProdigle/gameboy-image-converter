@@ -878,16 +878,12 @@ def limit_colors(image, limit=16, quantize=None, dither=None, palette_image=None
 
 
 def create_palette_from_colors(color_list):
-    # Create an empty image with size (1, len(color_list))
-    palette_image = Image.new("RGB", (1, len(color_list)))
-
-    # Iterate over the colors and set each pixel in the corresponding row
-    for i, color in enumerate(color_list):
-        palette_image.putpixel((0, i), color)
-
-    # Convert the image to the palette mode
-    palette_image = palette_image.convert("P", palette=Image.ADAPTIVE)
-
+    palette_image = Image.new("P", (1, 1))
+    max_colors = min(len(color_list), 256)
+    selected_colors = color_list[:max_colors]
+    flat_palette = [component for color in selected_colors for component in color]
+    flat_palette.extend([0] * (768 - len(flat_palette)))
+    palette_image.putpalette(flat_palette)
     return palette_image
 
 
@@ -1205,10 +1201,17 @@ def create_gradio_interface():
         from skimage.color import deltaE_ciede2000
         from skimage.color import rgb2lab, lab2rgb
         from skimage import color  # Import the color module from scikit-image
-        def apply_palette(tile, palette):
+        def apply_palette(tile, palette, dither=Image.Dither.NONE):
             """
-            Applies a palette to a tile using vectorized operations for efficiency.
+            Apply a palette to a tile, optionally using dithering while respecting the palette entries.
             """
+            if dither != Image.Dither.NONE:
+                if tile.mode != "RGB":
+                    tile = tile.convert("RGB")
+                palette_image = create_palette_from_colors(palette)
+                quantized_tile = tile.quantize(palette=palette_image, dither=dither)
+                return quantized_tile.convert("RGB")
+
             tile_array = np.array(tile)
             palette_array = np.array(palette)
 
@@ -1381,7 +1384,7 @@ def create_gradio_interface():
 
             return refined_palettes_rgb
 
-        def process_tiles(tiles, max_palettes=8, tile_width=8, tile_height=8, image_width=None, num_colors=4, should_dither=False, enhanced_palettes=None):
+        def process_tiles(tiles, max_palettes=8, tile_width=8, tile_height=8, image_width=None, num_colors=4, dither_method=Image.Dither.NONE, enhanced_palettes=None):
             """Process the tiles to limit them to the best 4-color palettes, based on global analysis and frequency."""
             # Step 1: Generate enhanced palettes considering the whole image
             tile_palette_mapping = []
@@ -1424,7 +1427,10 @@ def create_gradio_interface():
                 tile_palette_mapping.append(closest_palette_index)
 
             # Step 3: Apply the selected palettes to each tile
-            processed_tiles = [apply_palette(tiles[i], enhanced_palettes[tile_palettes[i]]) for i in range(len(tiles))]
+            processed_tiles = [
+                apply_palette(tiles[i], enhanced_palettes[tile_palettes[i]], dither=dither_method)
+                for i in range(len(tiles))
+            ]
 
             return processed_tiles, enhanced_palettes, palette_for_tile_text, tile_palette_mapping
 
@@ -1522,7 +1528,15 @@ def create_gradio_interface():
                 if limit_4_colors_per_tile and not reduce_tile_flag:
                     image_for_reference_palette: Image = image.copy()
                     tiles = extract_tiles(image_for_reference_palette)
-                    processed_tiles, enhanced_palettes, text_for_palette_tile_application, tile_palette_mapping = process_tiles(tiles,8,8,8, image_for_reference_palette.width, num_colors, True if dither_method_key != "None" else False)
+                    processed_tiles, enhanced_palettes, text_for_palette_tile_application, tile_palette_mapping = process_tiles(
+                        tiles,
+                        8,
+                        8,
+                        8,
+                        image_for_reference_palette.width,
+                        num_colors,
+                        dither_method=DITHER_METHODS[dither_method_key],
+                    )
                     # Reconstruct the image from the processed tiles
                     new_image = Image.new('RGB', image_for_reference_palette.size)
                     tile_index = 0
@@ -1548,7 +1562,15 @@ def create_gradio_interface():
                         if limit_4_colors_per_tile:
                             image = image_for_reference_palette.copy()
                             if not enhanced_palettes or not tile_palette_mapping:
-                                processed_tiles, enhanced_palettes, text_for_palette_tile_application, tile_palette_mapping = process_tiles(extract_tiles(image),8,8,8, image_for_reference_palette.width, num_colors, True if dither_method_key != "None" else False, False)
+                                processed_tiles, enhanced_palettes, text_for_palette_tile_application, tile_palette_mapping = process_tiles(
+                                    extract_tiles(image),
+                                    8,
+                                    8,
+                                    8,
+                                    image_for_reference_palette.width,
+                                    num_colors,
+                                    dither_method=DITHER_METHODS[dither_method_key],
+                                )
                             custom_palette = custom_palette.quantize(colors=num_colors,
                                                                      method=QUANTIZATION_METHODS[quant_method_key],
                                                                      dither=DITHER_METHODS[dither_method_key])
@@ -1598,7 +1620,16 @@ def create_gradio_interface():
                     # image, notice = reduce_tiles_index(image, similarity_threshold=reduce_tile_threshold, custom_palette_colors=custom_palette_info)
                     image = image.convert("RGB")
                     tiles = extract_tiles(image)
-                    processed_tiles, enhanced_palettes, text_for_palette_tile_application, tile_palette_mapping = process_tiles(tiles,8,8,8, image_for_reference_palette.width, len(image.getcolors()), enhanced_palettes=enhanced_palettes)
+                    processed_tiles, enhanced_palettes, text_for_palette_tile_application, tile_palette_mapping = process_tiles(
+                        tiles,
+                        8,
+                        8,
+                        8,
+                        image_for_reference_palette.width,
+                        len(image.getcolors()),
+                        dither_method=DITHER_METHODS[dither_method_key],
+                        enhanced_palettes=enhanced_palettes,
+                    )
 
                     if use_custom_palette:
                         image_tiles = processed_tiles
