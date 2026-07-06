@@ -628,3 +628,305 @@ def dedup_patterns(gb: GBImage, allow_flips: bool) -> GBImage:
         attrs_vflip=new_vflip,
         palettes=gb.palettes,
     )
+
+
+# ---------------------------------------------------------------------------
+# Stage 6 -- budget merge (lossy)
+# ---------------------------------------------------------------------------
+#
+# Only runs when the lossless-dedup tile count still exceeds the budget. Each
+# pattern gets a static "signature" -- itself rendered under its usage-weighted
+# average palette, in CIELAB -- and the globally cheapest merges (perceptual
+# signature distance x usage of the replaced pattern) are applied cheapest-first
+# from a min-heap until the live pattern count lands exactly on the budget.
+# Merges only retarget tilemap references (composing flip bits); they can never
+# affect palette constraints. See the design spec, section "Stage 6".
+
+# Above this many patterns the full O(n^2) signature-distance matrix becomes
+# expensive; we fall back to KMeans-clustering signatures and only considering
+# intra-cluster merge candidates (correctness fallback: recluster survivors,
+# and if a pass makes no progress, compare all remaining pairs directly).
+_MERGE_MATRIX_MAX = 3500
+
+# Spatial-flip variants of a pattern signature. For a stack of signatures with
+# shape (..., 8, 8, 3): axis -3 is rows (vertical flip), axis -2 is columns
+# (horizontal flip).
+_VARIANT_NAMES_FLIP = ("", "h", "v", "hv")
+_VARIANT_NAMES_NOFLIP = ("",)
+
+
+def _flip_signature(sig: np.ndarray, variant: str) -> np.ndarray:
+    """Apply an h/v flip variant to an (..., 8, 8, 3) signature array."""
+    out = sig
+    if "h" in variant:
+        out = np.flip(out, axis=-2)  # columns == horizontal
+    if "v" in variant:
+        out = np.flip(out, axis=-3)  # rows == vertical
+    return out
+
+
+def _pattern_signatures(gb: GBImage) -> np.ndarray:
+    """Render every pattern under its usage-weighted average palette -> Lab.
+
+    For each pattern, the weight of palette id ``pid`` is the number of cells
+    that reference the pattern with that palette. The averaged palette (a
+    (4, 3) RGB blend) renders the pattern's indices to colors, which are then
+    converted to CIELAB. Returns (n, 8, 8, 3) float64. Signatures are computed
+    once from the *initial* cell assignments and are treated as static across
+    all merges (patterns never change; only tilemap references move).
+    """
+    n = int(gb.patterns.shape[0])
+    p = int(gb.palettes.shape[0])
+    flat_pat = gb.tilemap.reshape(-1).astype(np.int64)
+    flat_pid = gb.attrs_palette.reshape(-1).astype(np.int64)
+
+    # usage_pal[pattern, palette] = cell count.
+    usage_pal = np.zeros((n, p), dtype=np.float64)
+    np.add.at(usage_pal, (flat_pat, flat_pid), 1.0)
+
+    wsum = usage_pal.sum(axis=1)  # (n,)
+    # Weighted average palette per pattern: (n, 4, 3).
+    avg_pal = np.tensordot(usage_pal, gb.palettes.astype(np.float64), axes=([1], [0]))
+    avg_pal = avg_pal / np.maximum(wsum[:, None, None], 1e-9)
+
+    idx = gb.patterns.reshape(n, 64).astype(np.int64)  # (n, 64) values 0-3
+    sig_rgb = np.take_along_axis(
+        avg_pal, idx[:, :, None].repeat(3, axis=2), axis=1
+    )  # (n, 64, 3)
+    sig_rgb = sig_rgb.reshape(n, 8, 8, 3) / 255.0
+    sig_lab = rgb2lab(sig_rgb)  # (n, 8, 8, 3)
+    return sig_lab.astype(np.float64)
+
+
+def _weighted_percentile(values: np.ndarray, weights: np.ndarray, pct: float) -> float:
+    """Weighted percentile (0-100) of ``values`` with nonnegative ``weights``."""
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    weights = np.asarray(weights, dtype=np.float64).reshape(-1)
+    if values.size == 0:
+        return 0.0
+    order = np.argsort(values, kind="stable")
+    v = values[order]
+    w = weights[order]
+    cw = np.cumsum(w)
+    total = float(cw[-1])
+    if total <= 0:
+        return float(v[-1])
+    threshold = (pct / 100.0) * total
+    idx = int(np.searchsorted(cw, threshold, side="left"))
+    idx = min(idx, v.size - 1)
+    return float(v[idx])
+
+
+def _simple_kmeans_labels(points: np.ndarray, k: int, seed: int = 42) -> np.ndarray:
+    """Deterministic k-means++ cluster labels for (N, D) points (any D)."""
+    points = np.asarray(points, dtype=np.float64)
+    n = points.shape[0]
+    if k >= n:
+        return np.arange(n, dtype=np.int64)
+    rng = np.random.RandomState(seed)
+    first = int(rng.randint(n))
+    centers = [points[first]]
+    d2 = np.sum((points - points[first]) ** 2, axis=1)
+    for _ in range(1, k):
+        s = d2.sum()
+        j = int(rng.choice(n, p=d2 / s)) if s > 0 else int(rng.randint(n))
+        centers.append(points[j])
+        d2 = np.minimum(d2, np.sum((points - points[j]) ** 2, axis=1))
+    centers = np.array(centers, dtype=np.float64)
+    labels = np.zeros(n, dtype=np.int64)
+    for _ in range(10):
+        dists = np.sum((points[:, None, :] - centers[None, :, :]) ** 2, axis=2)
+        new_labels = np.argmin(dists, axis=1)
+        if np.array_equal(new_labels, labels):
+            labels = new_labels
+            break
+        labels = new_labels
+        for c in range(k):
+            mask = labels == c
+            if mask.any():
+                centers[c] = points[mask].mean(axis=0)
+    return labels
+
+
+def merge_to_budget(gb: GBImage, budget: int, allow_flips: bool) -> tuple:
+    """Lossily merge patterns until ``len(patterns) <= budget``, cheapest-first.
+
+    Returns ``(result, n_merges)``. When the input already fits the budget the
+    image is returned unchanged with ``0`` merges. The p95 of per-pixel Lab
+    distance over all merged cells (a heavy-merge quality signal for Stage 7)
+    is stashed on the returned GBImage as ``merge_p95_delta_e``.
+
+    Algorithm (design spec, Stage 6): each pattern's signature is itself
+    rendered under its usage-weighted average palette in CIELAB and is static
+    across merges. ``distance(A, B)`` is the minimum, over B's flip variants
+    (all four when ``allow_flips`` else identity only), of the mean squared Lab
+    difference, remembering the best orientation. ``cost(A -> B) =
+    distance(A, B) * usage(A)``, and pairs are pushed onto a min-heap oriented
+    so the replaced pattern A has the smaller usage. Popped entries are lazily
+    validated (both patterns alive, replaced usage unchanged) and re-pushed if
+    stale. A merge retargets every cell of A to B, composing the best
+    orientation's flip bits, and folds A's usage into B. Repeats until the live
+    count reaches the budget, then rebuilds a compact GBImage.
+    """
+    n = int(gb.patterns.shape[0])
+    if n <= budget:
+        gb.merge_p95_delta_e = 0.0
+        return gb, 0
+
+    variant_names = _VARIANT_NAMES_FLIP if allow_flips else _VARIANT_NAMES_NOFLIP
+
+    sig_lab = _pattern_signatures(gb)  # (n, 8, 8, 3)
+    sig_flat = sig_lab.reshape(n, 192)
+    # Flattened flip variants of each pattern used as a *target*.
+    var_flat = {v: _flip_signature(sig_lab, v).reshape(n, 192) for v in variant_names}
+
+    usage = np.bincount(
+        gb.tilemap.reshape(-1).astype(np.int64), minlength=n
+    ).astype(np.int64)
+
+    # Working copies mutated in place as cells are retargeted.
+    work_tilemap = gb.tilemap.copy().astype(np.int64)
+    work_hflip = gb.attrs_hflip.copy()
+    work_vflip = gb.attrs_vflip.copy()
+    alive = np.ones(n, dtype=bool)
+
+    # Optional full distance/orientation matrices (small-n fast path).
+    if n <= _MERGE_MATRIX_MAX:
+        best = np.full((n, n), np.inf, dtype=np.float64)
+        orient_idx = np.zeros((n, n), dtype=np.int8)
+        sqA = np.sum(sig_flat * sig_flat, axis=1)  # (n,)
+        for vi, v in enumerate(variant_names):
+            B = var_flat[v]
+            sqB = np.sum(B * B, axis=1)
+            cross = sig_flat @ B.T  # (n, n)
+            D = (sqA[:, None] + sqB[None, :] - 2.0 * cross) / 192.0
+            np.maximum(D, 0.0, out=D)
+            upd = D < best
+            best[upd] = D[upd]
+            orient_idx[upd] = vi
+        np.fill_diagonal(best, np.inf)
+
+        def dist_orient(a, b):
+            return float(best[a, b]), variant_names[int(orient_idx[a, b])]
+
+    else:
+        def dist_orient(a, b):
+            best_d = np.inf
+            best_v = ""
+            sa = sig_flat[a]
+            for v in variant_names:
+                diff = sa - var_flat[v][b]
+                d = float(np.mean(diff * diff))
+                if d < best_d:
+                    best_d = d
+                    best_v = v
+            return best_d, best_v
+
+    heap: list = []
+    counter = 0
+
+    def push_pair(i, j):
+        nonlocal counter
+        a, b = (i, j) if usage[i] <= usage[j] else (j, i)  # a == replaced
+        d, _ = dist_orient(a, b)
+        cost = d * float(usage[a])
+        heapq.heappush(heap, (cost, counter, int(a), int(b), int(usage[a])))
+        counter += 1
+
+    def seed_pairs(indices):
+        m = len(indices)
+        for ii in range(m):
+            for jj in range(ii + 1, m):
+                push_pair(indices[ii], indices[jj])
+
+    merge_records: list = []  # (per_pixel_lab_dist (64,), weight)
+    n_merges = 0
+    alive_count = n
+
+    def run_heap():
+        nonlocal n_merges, alive_count
+        while alive_count > budget and heap:
+            cost, _, a, b, snap = heapq.heappop(heap)
+            if not alive[a] or not alive[b]:
+                continue
+            if int(usage[a]) != snap:
+                # Replaced pattern absorbed others since push -> stale cost.
+                push_pair(a, b)
+                continue
+            # Valid cheapest merge a -> b.
+            _, v = dist_orient(a, b)
+            vh = "h" in v
+            vv = "v" in v
+            mask = work_tilemap == a
+            cnt = int(mask.sum())
+            work_tilemap[mask] = b
+            if vh:
+                work_hflip[mask] = ~work_hflip[mask]
+            if vv:
+                work_vflip[mask] = ~work_vflip[mask]
+
+            sa = sig_lab[a]
+            sb_v = var_flat[v][b].reshape(8, 8, 3)
+            diff = sa - sb_v
+            per_pixel = np.sqrt(np.sum(diff * diff, axis=2)).reshape(-1)  # (64,)
+            merge_records.append((per_pixel, cnt))
+
+            usage[b] += usage[a]
+            usage[a] = 0
+            alive[a] = False
+            alive_count -= 1
+            n_merges += 1
+
+    if n <= _MERGE_MATRIX_MAX:
+        seed_pairs(list(range(n)))
+        run_heap()
+    else:
+        # Clustering fast path: only push intra-cluster pairs, reclustering the
+        # survivors between passes. A pass that makes no progress falls back to
+        # comparing all remaining pairs directly (correctness guarantee).
+        while alive_count > budget:
+            survivors = [int(i) for i in np.nonzero(alive)[0]]
+            if len(survivors) <= budget:
+                break
+            before = n_merges
+            k = max(1, int(round(np.sqrt(len(survivors)))))
+            labels = _simple_kmeans_labels(sig_flat[survivors], k)
+            heap.clear()
+            for c in range(int(labels.max()) + 1):
+                members = [survivors[t] for t in np.nonzero(labels == c)[0]]
+                seed_pairs(members)
+            run_heap()
+            if n_merges == before:
+                # No intra-cluster merge possible -> compare everything.
+                heap.clear()
+                seed_pairs(survivors)
+                run_heap()
+                break
+
+    # --- Rebuild a compact GBImage over the surviving patterns --------------
+    alive_idx = np.nonzero(alive)[0]
+    remap = -np.ones(n, dtype=np.int64)
+    remap[alive_idx] = np.arange(alive_idx.size, dtype=np.int64)
+    new_tilemap = remap[work_tilemap].astype(np.int32)
+    assert new_tilemap.min() >= 0, "dangling reference to a merged-away pattern"
+
+    result = GBImage(
+        patterns=gb.patterns[alive_idx].copy(),
+        tilemap=new_tilemap,
+        attrs_palette=gb.attrs_palette.copy(),
+        attrs_hflip=work_hflip,
+        attrs_vflip=work_vflip,
+        palettes=gb.palettes,
+    )
+
+    if merge_records:
+        all_dists = np.concatenate([pp for pp, _ in merge_records])
+        all_weights = np.concatenate(
+            [np.full(pp.shape[0], w, dtype=np.float64) for pp, w in merge_records]
+        )
+        p95 = _weighted_percentile(all_dists, all_weights, 95.0)
+    else:
+        p95 = 0.0
+    result.merge_p95_delta_e = float(p95)
+
+    return result, n_merges
