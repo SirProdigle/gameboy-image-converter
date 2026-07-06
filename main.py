@@ -983,6 +983,41 @@ def _format_palette_text(palette_hex) -> str:
     return "\n".join(lines)
 
 
+def _swatch_html(hex_color: str) -> str:
+    """A single colored square + hex label, used by `_format_palette_html`."""
+    return (
+        '<div style="display:flex;flex-direction:column;align-items:center;margin:2px;">'
+        f'<div style="width:28px;height:28px;border:1px solid rgba(128,128,128,0.6);'
+        f'border-radius:4px;background:{hex_color};"></div>'
+        f'<span style="font-size:10px;font-family:monospace;">{hex_color}</span>'
+        '</div>'
+    )
+
+
+def _format_palette_html(palette_hex) -> str:
+    """Rendered palette swatches: one row per palette, one colored square +
+    copyable hex label per color. Replaces the old text-only dump as the
+    primary palette report; the textbox from `_format_palette_text` remains
+    below it as a copy-paste fallback.
+
+    `palette_hex` is a list of per-palette hex-string lists (the shape of
+    `ConversionResult.palette_hex`, and also used by the Artistic path as a
+    single-entry wrapper list around its flat color list).
+    """
+    if not palette_hex:
+        return "<div>No palette</div>"
+    rows = []
+    for i, colors in enumerate(palette_hex):
+        swatches = "".join(_swatch_html(c) for c in colors)
+        rows.append(
+            '<div style="margin-bottom:6px;">'
+            f'<div style="font-size:11px;opacity:0.7;">Palette {i + 1}</div>'
+            f'<div style="display:flex;flex-wrap:wrap;">{swatches}</div>'
+            '</div>'
+        )
+    return "".join(rows)
+
+
 def _process_artistic(image, color_limit, num_colors, quant_method, dither_method,
                       use_palette, custom_palette, grayscale, black_and_white, bw_threshold,
                       enable_gothic_filter, brightness_threshold, dot_size, spacing, contrast_boost,
@@ -1022,6 +1057,7 @@ def _process_artistic(image, color_limit, num_colors, quant_method, dither_metho
         text_for_palette += f"Palette {i + 1}: {value}\n"
     if not text_for_palette:
         text_for_palette = "None"
+    palette_html = _format_palette_html([palette_color_values] if palette_color_values else [])
 
     if enable_gothic_filter:
         image = apply_gothic_filter(image, brightness_threshold, dot_size, spacing, contrast_boost,
@@ -1041,7 +1077,7 @@ def _process_artistic(image, color_limit, num_colors, quant_method, dither_metho
     if black_and_white:
         image = convert_to_black_and_white(image, threshold=bw_threshold)
 
-    return image, text_for_palette, image_for_reference_palette, "No Warnings"
+    return image, text_for_palette, image_for_reference_palette, "No Warnings", palette_html
 
 
 def process_image(image, mode, width, height, aspect_ratio,
@@ -1095,7 +1131,8 @@ def process_image(image, mode, width, height, aspect_ratio,
 
         notice = _format_hardware_notice(result)
         palette_text = _format_palette_text(result.palette_hex)
-        return result.image, palette_text, result.reference, notice
+        palette_html = _format_palette_html(result.palette_hex)
+        return result.image, palette_text, result.reference, notice, palette_html
 
 
 def process_image_folder(input_files, mode, width, height, aspect_ratio,
@@ -1334,7 +1371,9 @@ def create_gradio_interface():
                             with gr.Column():
                                 github_html = gr.HTML(
                                     "<a href='https://github.com/SirProdigle/gameboy-image-converter' target='_blank' style='display: flex; justify-content: center; align-items: center; background-color: #24292e; border-radius: 8px; padding: 8px; text-decoration: none; color: white; font-weight: 600; height: 36px;'><svg width='24' height='24' viewBox='0 0 24 24' fill='white' style='margin-right: 8px;'><path d='M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z'/></svg>View on GitHub</a>")
-                    palette_text = gr.Textbox(label="Custom Palette Info", value="None", interactive=False,
+                    palette_html_output = gr.HTML(value=_format_palette_html([]), label="Palette Swatches")
+                    palette_text = gr.Textbox(label="Custom Palette Info (copyable hex)", value="None",
+                                          interactive=False,
                                           show_copy_button=True, lines=4, max_lines=4, autoscroll=False)
                 with gr.Row():
                     execute_button = gr.Button("Convert Image")
@@ -1357,7 +1396,8 @@ def create_gradio_interface():
         execute_button.click(run_in_task_executor(process_image),
                              inputs=[image_input, mode_radio] + shared_inputs,
                              outputs=[image_output, palette_text,
-                                      image_output_no_palette, notice_text])
+                                      image_output_no_palette, notice_text,
+                                      palette_html_output])
 
         execute_button_folder.click(run_in_task_executor(process_image_folder),
                                     inputs=[folder_input, mode_radio] + shared_inputs,

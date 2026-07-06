@@ -98,26 +98,31 @@ def test_create_gradio_interface_builds():
 def test_process_image_each_simple_mode(mode):
     image = _small_test_image()
     palette = Image.open(GB_PALETTE_PATH).convert("RGB")
-    out_image, palette_text, reference_image, notice = _call_process_image(mode, image, palette)
+    out_image, palette_text, reference_image, notice, palette_html = _call_process_image(mode, image, palette)
 
     assert isinstance(out_image, Image.Image)
     assert out_image.mode == "RGB"
     assert isinstance(reference_image, Image.Image)
     assert isinstance(palette_text, str) and palette_text
     assert isinstance(notice, str) and notice
+    assert isinstance(palette_html, str) and palette_html
+    assert "background:#" in palette_html.lower()
+    assert "palette 1" in palette_html.lower()
 
 
 @pytest.mark.parametrize("logo_subtype", ["Color", "Mono"])
 def test_process_image_logo_mode(logo_subtype):
     image = _small_test_image()
     palette = Image.open(GB_PALETTE_PATH).convert("RGB")
-    out_image, palette_text, reference_image, notice = _call_process_image(
+    out_image, palette_text, reference_image, notice, palette_html = _call_process_image(
         main.MODE_LOGO, image, palette, logo_subtype=logo_subtype,
     )
 
     assert isinstance(out_image, Image.Image)
     assert out_image.size == (160, 144)
     assert "no tile limit" in notice
+    assert isinstance(palette_html, str) and palette_html
+    assert "background:#" in palette_html.lower()
 
 
 def test_process_image_hardware_routes_to_convert_for_hardware(monkeypatch):
@@ -212,6 +217,20 @@ def test_adjust_for_aspect_ratio_uses_explicit_state_not_globals():
     assert (width, height) == (100, 50)
     width, height = main.adjust_for_aspect_ratio(False, 100, 50, 200, 100)
     assert (width, height) == (100, 50)
+
+
+def test_format_palette_html_empty():
+    assert main._format_palette_html([]) == "<div>No palette</div>"
+
+
+def test_format_palette_html_renders_swatches_and_hex():
+    html = main._format_palette_html([["#AABBCC", "#001122"], ["#FFFFFF"]])
+    assert "Palette 1" in html
+    assert "Palette 2" in html
+    assert "#AABBCC" in html
+    assert "#001122" in html
+    assert "#FFFFFF" in html
+    assert html.count("background:#") == 3
 
 
 def test_capture_original_dimensions_handles_none():
