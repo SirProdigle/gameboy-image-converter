@@ -988,21 +988,27 @@ def render(gb: GBImage) -> Image.Image:
     return Image.fromarray(out, "RGB")
 
 
-def _colors_to_indices(block: np.ndarray, palette: np.ndarray) -> np.ndarray:
-    """Map an (8, 8, 3) tile's pixels to palette indices by exact color match.
+def _luminance_reindex(block: np.ndarray) -> np.ndarray:
+    """Re-index an (8, 8, 3) tile's pixels by tile-local luminance order.
 
-    A pixel that equals several palette entries (duplicate colors in a padded
-    palette) takes the lowest such index -- mirroring how ``index_tiles``
-    resolves ties. Asserts every pixel matches some palette color.
+    This mirrors GB Studio's importer, which re-indexes each tile using only
+    its *own* rendered colors: the tile's unique colors are ranked lightest
+    first (the ``luminance_sort`` convention) and every pixel takes its color's
+    rank (0-3). It deliberately consults no source palette, so the resulting
+    pattern -- and therefore the round-trip tile count -- is derived purely
+    from the rendered PNG. A tile that draws two duplicate palette entries as
+    one color, or that borrows a higher palette slot for a color another tile
+    reached via a lower slot, collapses to the same rank pattern here exactly
+    as it would on hardware.
     """
     block = np.asarray(block, dtype=np.uint8)
-    palette = np.asarray(palette, dtype=np.uint8)
-    idx = np.full(block.shape[:2], -1, dtype=np.int64)
-    for i in range(palette.shape[0]):
-        match = np.all(block == palette[i], axis=2) & (idx < 0)
-        idx[match] = i
-    assert idx.min() >= 0, "rendered pixel is not one of its palette colors"
-    return idx.astype(np.uint8)
+    colors = np.unique(block.reshape(-1, 3), axis=0)  # deterministic order
+    lum = _pixel_luminance(colors)
+    ranked = colors[np.argsort(-lum, kind="stable")]  # lightest first
+    idx = np.full(block.shape[:2], 0, dtype=np.uint8)
+    for rank, color in enumerate(ranked):
+        idx[np.all(block == color, axis=2)] = rank
+    return idx
 
 
 def _canonical_2bpp(pattern: np.ndarray, allow_flips: bool) -> bytes:
@@ -1016,16 +1022,23 @@ def verify_roundtrip(png: Image.Image, preset: Preset, expected: GBImage) -> Non
     """Independently re-import ``png`` and assert the hardware invariants.
 
     Independent round-trip (spec Stage 7.2): crop each 8x8 tile, require <=4
-    unique colors, require every color to be RGB555-stable, recover the tile's
-    index pattern against its assigned palette and hash it as 2bpp
-    (canonicalizing flips when the preset allows them); assert the
-    reconstructed unique-tile count equals ``len(expected.patterns)`` and stays
-    within the tile budget (skipped for logo presets, whose tiles are stored
-    sequentially without dedup). Structural GBImage assertions (spec Stage 7.1):
-    the palette count is within ``preset.n_palettes`` and the stored palettes
-    are RGB555-only. Because every tile's pixels are matched exactly against
-    its assigned palette, a passing round-trip also proves each tile renders
-    from one of those <= n_palettes 4-color palettes.
+    unique colors, require every color to be RGB555-stable, then recover the
+    tile's index pattern *from the PNG alone* -- ranking the tile's own colors
+    by luminance (``_luminance_reindex``), exactly as GB Studio's importer
+    re-indexes each tile -- and hash it as 2bpp (canonicalizing flips when the
+    preset allows them). The number of distinct hashes is the true count of
+    tiles the hardware would store. Because this derivation never consults
+    ``expected``'s indices, it can diverge from ``len(expected.patterns)`` when
+    the pipeline over-counts (e.g. two tiles that render identically via
+    duplicate palette entries stay separate in ``patterns`` but collapse to one
+    tile on import); the assertion therefore requires the re-imported count to
+    be no greater than the stored count and to stay within the tile budget
+    (both skipped for logo presets, whose tiles are stored sequentially without
+    dedup). Palette membership is checked independently of index derivation:
+    every tile's colors must be a subset of one stored palette, proving each
+    tile renders from one of the <= n_palettes 4-color palettes. Structural
+    GBImage assertions (spec Stage 7.1): the palette count is within
+    ``preset.n_palettes`` and the stored palettes are RGB555-only.
     """
     arr = np.asarray(png.convert("RGB"), dtype=np.uint8)
     th, tw = expected.tilemap.shape
@@ -1039,6 +1052,11 @@ def verify_roundtrip(png: Image.Image, preset: Preset, expected: GBImage) -> Non
         "stored palette is not RGB555-stable"
     )
 
+    # Color sets of the stored palettes, for independent membership checks.
+    palette_sets = [
+        frozenset(map(tuple, pal.tolist())) for pal in expected.palettes
+    ]
+
     budget = preset.tile_budget
     canon_hashes = set()
     for tr in range(th):
@@ -1048,19 +1066,31 @@ def verify_roundtrip(png: Image.Image, preset: Preset, expected: GBImage) -> Non
             assert uniq.shape[0] <= 4, "tile has more than 4 colors"
             assert np.array_equal(snap_rgb555(uniq), uniq), "color not RGB555-stable"
 
-            pal = expected.palettes[int(expected.attrs_palette[tr, tc])]
-            idx_pattern = _colors_to_indices(block, pal)
+            # Independent palette membership: the tile's colors must all live
+            # in one stored 4-color palette (never derived from the index data).
+            tile_colors = frozenset(map(tuple, uniq.tolist()))
+            assert any(tile_colors <= ps for ps in palette_sets), (
+                "tile colors are not a subset of any stored palette"
+            )
+
+            idx_pattern = _luminance_reindex(block)
             canon_hashes.add(_canonical_2bpp(idx_pattern, preset.allow_flips))
 
     n_expected = int(expected.patterns.shape[0])
+    n_reimport = len(canon_hashes)
     if budget is None:
         # Logo: sequential storage, no dedup -- one stored tile per cell.
         assert n_expected == th * tw, "logo tile count must equal cell count"
     else:
-        assert len(canon_hashes) == n_expected, (
-            f"reimport found {len(canon_hashes)} tiles, expected {n_expected}"
+        # The independent re-import can only merge tiles the pipeline kept
+        # separate, never split one, so it must not exceed the stored count.
+        assert n_reimport <= n_expected, (
+            f"reimport found {n_reimport} tiles, more than the {n_expected} "
+            "stored -- pipeline/import divergence"
         )
-        assert len(canon_hashes) <= budget, "tile count exceeds budget"
+        assert n_reimport <= budget, (
+            f"reimport found {n_reimport} tiles, over budget {budget}"
+        )
 
 
 def _index_tiles_mono(

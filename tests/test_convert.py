@@ -121,6 +121,50 @@ def test_verify_roundtrip_detects_over_budget():
         verify_roundtrip(png, tight, gb)
 
 
+def test_verify_roundtrip_independent_of_stored_indices():
+    # Regression: two stored patterns that RENDER IDENTICALLY (one reaches a
+    # color through a duplicate palette slot, the other through a single slot)
+    # must not trip verify. GB Studio's importer sees one tile, so an
+    # independent re-import (indices ranked by tile-local luminance) must too --
+    # a verifier that instead reconstructs indices against the tile's assigned
+    # palette would hash both to the same pattern yet still demand two, and the
+    # old coupled implementation raised "reimport found 1 tiles, expected 2".
+    dark = snap_rgb555(np.array([16, 16, 16], dtype=np.uint8)).tolist()
+    # Palette with a DUPLICATE dark entry at slots 2 and 3.
+    palettes = snap_rgb555(
+        np.array([[240, 240, 240], [160, 160, 160], dark, dark], dtype=np.uint8)
+    )[None, :, :]
+
+    # Pattern A draws the right half using BOTH duplicate slots (2 and 3);
+    # pattern B draws the identical picture using only slot 2. Same pixels,
+    # different 2bpp bytes -> two distinct stored patterns.
+    pat_a = np.zeros((8, 8), dtype=np.uint8)
+    pat_a[:, 4:6] = 2
+    pat_a[:, 6:8] = 3
+    pat_b = np.zeros((8, 8), dtype=np.uint8)
+    pat_b[:, 4:8] = 2
+    assert pattern_to_2bpp(pat_a) != pattern_to_2bpp(pat_b)
+
+    gb = GBImage(
+        patterns=np.stack([pat_a, pat_b]),
+        tilemap=np.array([[0, 1]], dtype=np.int32),
+        attrs_palette=np.zeros((1, 2), dtype=np.uint8),
+        attrs_hflip=np.zeros((1, 2), dtype=bool),
+        attrs_vflip=np.zeros((1, 2), dtype=bool),
+        palettes=palettes,
+    )
+    png = render(gb)
+    # Both cells render to the same 8x8 block (dark right half).
+    arr = np.asarray(png)
+    assert np.array_equal(arr[:, 0:8], arr[:, 8:16])
+
+    preset = gb_pipeline.Preset("t", tile_budget=4, n_palettes=1,
+                                allow_flips=False, mono=False, fixed_size=None)
+    # Independent re-import collapses to one tile (1 <= 2 stored, 1 <= budget):
+    # must not raise.
+    verify_roundtrip(png, preset, gb)
+
+
 # ---------------------------------------------------------------------------
 # property-style: seeded images x presets
 
