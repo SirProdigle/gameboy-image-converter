@@ -31,6 +31,8 @@ from typing import Callable, Optional
 
 from monitoring import HeartbeatMonitor, QueueClearedError, TaskExecutor, TaskMetrics
 
+import gb_pipeline
+
 
 
 # Constants for dithering and quantization methods
@@ -896,152 +898,421 @@ def convert_to_black_and_white(image: Image, threshold: int = 128, is_inversed: 
     return image.convert('L').point(apply_threshold, mode='1').convert("RGB")
 
 
-# Gradio UI and processing function
-original_width = gr.State(value=0)
-original_height = gr.State(value=0)
-palette_color_1_string = gr.State(value="#000000")
-palette_color_2_string = gr.State(value="#000000")
-palette_color_3_string = gr.State(value="#000000")
-palette_color_4_string = gr.State(value="#000000")
-quantize_for_GBC = gr.State(False)
-use_tile_variance = gr.State(False)
+
+
+# ---------------------------------------------------------------------------
+# Gradio UI and processing functions
+# ---------------------------------------------------------------------------
+#
+# Mode-first layout: a top-level radio picks Artistic (today's free-form flow,
+# unchanged) or one of the three GB Studio hardware modes, which route through
+# gb_pipeline.convert_for_hardware instead of the old similarity-threshold /
+# tile-reduction machinery. `original_width`/`original_height` and the
+# `quantize_for_GBC`/`use_tile_variance` flags are no longer module-level
+# `gr.State` globals (which raced across concurrent users on the hosted app);
+# they flow as ordinary per-session `gr.State` components wired as event
+# inputs/outputs instead.
+
+MODE_ARTISTIC = "Artistic"
+MODE_COLOR = "GB Studio: Color"
+MODE_MONO = "GB Studio: Mono"
+MODE_LOGO = "GB Studio: Logo"
+HARDWARE_MODES = (MODE_COLOR, MODE_MONO, MODE_LOGO)
+
+HW_DITHER_METHODS = {"None": "none", "Bayer": "bayer"}
+
+
+def _hardware_preset_for_mode(mode: str, logo_subtype: str) -> str:
+    """Map a UI mode (+ logo sub-toggle) to a gb_pipeline.PRESETS key."""
+    if mode == MODE_COLOR:
+        return "color_only"
+    if mode == MODE_MONO:
+        return "mono"
+    if mode == MODE_LOGO:
+        return "logo_mono" if logo_subtype == "Mono" else "logo_color"
+    raise ValueError(f"not a hardware mode: {mode!r}")
+
+
+def _image_unique_colors(image: Image.Image) -> np.ndarray:
+    """(N, 3) uint8 array of an RGB image's unique colors."""
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    return np.unique(arr.reshape(-1, 3), axis=0)
+
+
+def _custom_palette_array(palette_image):
+    """Custom palette restriction set for hardware Color mode, or None."""
+    if palette_image is None:
+        return None
+    return _image_unique_colors(palette_image)
+
+
+def _mono_ramp_array(palette_image):
+    """4-color mono ramp extracted from the palette/ramp image, or None.
+
+    None falls back to gb_pipeline's default DMG ramp. The default value of
+    the shared palette image widget is `gb_palette.png`, which already *is*
+    the DMG reference ramp, so the common case is a no-op passthrough.
+    """
+    if palette_image is None:
+        return None
+    quant = palette_image.convert("RGB").quantize(
+        colors=4, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE
+    )
+    colors = quant.convert("RGB").getcolors(maxcolors=4)
+    if not colors:
+        return None
+    return np.array([color for _count, color in colors], dtype=np.uint8)
+
+
+def _format_hardware_notice(result: "gb_pipeline.ConversionResult") -> str:
+    stats = result.stats
+    if stats["tile_budget"] is None:
+        tiles_part = f"{stats['tiles_used']} tiles (no tile limit)"
+    else:
+        tiles_part = f"{stats['tiles_used']}/{stats['tile_budget']} tiles"
+    notice = f"✅ {tiles_part} · {stats['palettes_used']} palettes · {stats['n_merges']} merges"
+    if result.warnings:
+        notice += "\n" + "\n".join(result.warnings)
+    return notice
+
+
+def _format_palette_text(palette_hex) -> str:
+    if not palette_hex:
+        return "None"
+    lines = [f"Palette {i + 1}: {colors}" for i, colors in enumerate(palette_hex)]
+    return "\n".join(lines)
+
+
+def _process_artistic(image, color_limit, num_colors, quant_method, dither_method,
+                      use_palette, custom_palette, grayscale, black_and_white, bw_threshold,
+                      enable_gothic_filter, brightness_threshold, dot_size, spacing, contrast_boost,
+                      noise_factor, edge_enhance, apply_blur, irregular_shape, irregular_size):
+    """The free-form Artistic conversion flow -- unchanged from before the
+    hardware pipeline redesign, minus the removed hardware-only controls
+    (similarity threshold, tile-variance sort, 4-colors-per-tile, tile
+    reduction), which are subsumed by the GB Studio hardware modes instead.
+    """
+    quant_method_key = quant_method if quant_method in QUANTIZATION_METHODS else 'Median cut'
+    dither_method_key = dither_method if dither_method in DITHER_METHODS else 'None'
+
+    image_for_reference_palette = image.copy()
+    if color_limit:
+        image_for_reference_palette = limit_colors(
+            image_for_reference_palette, limit=num_colors,
+            quantize=QUANTIZATION_METHODS[quant_method_key],
+            dither=DITHER_METHODS[dither_method_key],
+        )
+        image_for_reference_palette = image_for_reference_palette.convert('RGB')
+
+    palette_colors = image_for_reference_palette.getcolors(maxcolors=num_colors)
+    if palette_colors is None:
+        palette_colors = image_for_reference_palette.quantize(colors=num_colors).convert('RGB').getcolors(maxcolors=num_colors)
+    palette_colors = [color for _count, color in (palette_colors or [])]
+    palette_color_values = ["#{0:02x}{1:02x}{2:02x}".format(*color) for color in palette_colors]
+
+    if use_palette and custom_palette is not None:
+        image = limit_colors(image, limit=num_colors, quantize=QUANTIZATION_METHODS[quant_method_key],
+                             dither=DITHER_METHODS[dither_method_key], palette_image=custom_palette)
+    else:
+        image = limit_colors(image, limit=num_colors, quantize=QUANTIZATION_METHODS[quant_method_key],
+                             dither=DITHER_METHODS[dither_method_key])
+
+    text_for_palette = ""
+    for i, value in enumerate(palette_color_values):
+        text_for_palette += f"Palette {i + 1}: {value}\n"
+    if not text_for_palette:
+        text_for_palette = "None"
+
+    if enable_gothic_filter:
+        image = apply_gothic_filter(image, brightness_threshold, dot_size, spacing, contrast_boost,
+                                    edge_enhance, noise_factor, apply_blur, irregular_shape, irregular_size)
+        image_for_reference_palette = apply_gothic_filter(
+            image_for_reference_palette, brightness_threshold, dot_size, spacing, contrast_boost,
+            edge_enhance, noise_factor, apply_blur, irregular_shape, irregular_size,
+        )
+
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+    if image_for_reference_palette.mode != "RGB":
+        image_for_reference_palette = image_for_reference_palette.convert("RGB")
+
+    if grayscale:
+        image = convert_to_grayscale(image)
+    if black_and_white:
+        image = convert_to_black_and_white(image, threshold=bw_threshold)
+
+    return image, text_for_palette, image_for_reference_palette, "No Warnings"
+
+
+def process_image(image, mode, width, height, aspect_ratio,
+                  color_limit, num_colors, quant_method, artistic_dither_method,
+                  use_custom_palette, custom_palette,
+                  grayscale, black_and_white, bw_threshold,
+                  enable_gothic_filter, brightness_threshold, dot_size, spacing, contrast_boost,
+                  noise_factor, edge_enhance, apply_blur, irregular_shape, irregular_size,
+                  reserve_ui_palette, hw_dither_method, tile_budget, logo_subtype):
+    """Route a single image through the Artistic flow or a GB Studio hardware
+    preset, depending on `mode`. Hardware modes call
+    `gb_pipeline.convert_for_hardware`; the Artistic path is untouched.
+    """
+    with task_log("process_image"):
+        if image is None:
+            raise gr.Error("Please provide an input image.")
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        image = downscale_image(image, int(width), int(height), aspect_ratio)
+
+        if mode not in HARDWARE_MODES:
+            return _process_artistic(
+                image, color_limit, num_colors, quant_method, artistic_dither_method,
+                use_custom_palette, custom_palette, grayscale, black_and_white, bw_threshold,
+                enable_gothic_filter, brightness_threshold, dot_size, spacing, contrast_boost,
+                noise_factor, edge_enhance, apply_blur, irregular_shape, irregular_size,
+            )
+
+        preset = _hardware_preset_for_mode(mode, logo_subtype)
+        is_logo = preset.startswith("logo")
+        preset_info = gb_pipeline.PRESETS[preset]
+
+        custom_palette_arr = None
+        mono_ramp_arr = None
+        if preset_info.mono:
+            mono_ramp_arr = _mono_ramp_array(custom_palette)
+        elif use_custom_palette:
+            custom_palette_arr = _custom_palette_array(custom_palette)
+
+        budget = None if is_logo else int(tile_budget)
+        dither_key = HW_DITHER_METHODS.get(hw_dither_method, "none")
+
+        result = gb_pipeline.convert_for_hardware(
+            image, preset,
+            tile_budget=budget,
+            reserve_ui_palette=bool(reserve_ui_palette),
+            dither=dither_key,
+            custom_palette=custom_palette_arr,
+            mono_ramp=mono_ramp_arr,
+        )
+
+        notice = _format_hardware_notice(result)
+        palette_text = _format_palette_text(result.palette_hex)
+        return result.image, palette_text, result.reference, notice
+
+
+def process_image_folder(input_files, mode, width, height, aspect_ratio,
+                         color_limit, num_colors, quant_method, artistic_dither_method,
+                         use_custom_palette, custom_palette,
+                         grayscale, black_and_white, bw_threshold,
+                         enable_gothic_filter, brightness_threshold, dot_size, spacing, contrast_boost,
+                         noise_factor, edge_enhance, apply_blur, irregular_shape, irregular_size,
+                         reserve_ui_palette, hw_dither_method, tile_budget, logo_subtype):
+    with task_log("process_image_folder"):
+        folder_name = "output_" + str(random.randint(0, 100000))
+        while os.path.exists(folder_name):
+            folder_name = "output_" + str(random.randint(0, 100000))
+        os.makedirs(folder_name)
+        try:
+            text_for_palette = []
+            for index, file in enumerate(input_files):
+                if os.path.isdir(file.name):
+                    continue
+                image_data = Image.open(file.name)
+                result = process_image(
+                    image_data, mode, width, height, aspect_ratio,
+                    color_limit, num_colors, quant_method, artistic_dither_method,
+                    use_custom_palette, custom_palette,
+                    grayscale, black_and_white, bw_threshold,
+                    enable_gothic_filter, brightness_threshold, dot_size, spacing, contrast_boost,
+                    noise_factor, edge_enhance, apply_blur, irregular_shape, irregular_size,
+                    reserve_ui_palette, hw_dither_method, tile_budget, logo_subtype,
+                )
+                base_name = os.path.basename(input_files[index].name)
+                result[0].save(os.path.join(folder_name, base_name))
+                result[2].save(os.path.join(
+                    folder_name,
+                    base_name.replace(".png", "_palette.png").replace(".jpg", "_palette.jpg"),
+                ))
+                text_for_palette.append(f"File {index + 1}: {base_name}\n{result[1]}")
+
+            with zipfile.ZipFile(os.path.join(folder_name, folder_name + ".zip"), 'w') as zipf:
+                for root, _dirs, files in os.walk(folder_name):
+                    for file_name in files:
+                        if file_name != folder_name + ".zip":
+                            zipf.write(
+                                os.path.join(root, file_name),
+                                os.path.relpath(os.path.join(root, file_name), folder_name),
+                            )
+                zipf.writestr("palette_info.txt", "\n\n".join(text_for_palette))
+            return os.path.join(os.getcwd(), folder_name, folder_name + ".zip"), "\n\n".join(text_for_palette), None, None
+
+        except Exception as e:
+            os.system("rm -rf " + folder_name)
+            print(traceback.format_exc())
+            return None, "Error processing folder " + str(e), None, None
 
 
 def capture_original_dimensions(image):
-    # Update global variables with the dimensions of the uploaded image
+    """Report an uploaded image's dimensions as plain return values (no
+    module-level state mutation -- see the module docstring above)."""
+    if image is None:
+        return image, 0, 0
     width, height = image.size
-    return width, height, image  # Return original dimensions and the unchanged image for further processing
+    return image, width, height
 
 
-def adjust_for_aspect_ratio(keep_aspect, current_width, current_height):
-    if keep_aspect and original_width.value and original_height.value:
-        # Using the global variables for original dimensions
-        aspect_ratio = original_width.value / original_height.value
-        # Calculate the new height based on the new width while maintaining the original aspect ratio
+def adjust_for_aspect_ratio(keep_aspect, current_width, current_height, orig_width, orig_height):
+    if keep_aspect and orig_width and orig_height:
+        aspect_ratio = orig_width / orig_height
         new_height = int(current_width / aspect_ratio)
         return current_width, new_height
-    else:
-        return current_width, current_height
+    return current_width, current_height
+
+
+def on_gb_screen_click():
+    return False, 160, 144
+
+
+def on_original_resolution_click(orig_width, orig_height):
+    return False, orig_width or 160, orig_height or 144
+
+
+def on_mode_or_logo_change(mode, logo_subtype):
+    """Toggle Artistic-vs-hardware panel visibility for a mode/logo-subtype
+    change. Order matches the `outputs` list on both `.change()` wirings."""
+    is_artistic = mode == MODE_ARTISTIC
+    is_color = mode == MODE_COLOR
+    is_mono = mode == MODE_MONO
+    is_logo = mode == MODE_LOGO
+    reserve_visible = is_color or (is_logo and logo_subtype != "Mono")
+    tiles_visible = is_color or is_mono
+    tile_budget_value = 384 if is_color else 192 if is_mono else 384
+    return (
+        gr.update(visible=is_artistic),                            # artistic_panel
+        gr.update(visible=not is_artistic),                        # hardware_panel
+        gr.update(visible=reserve_visible),                        # reserve_ui_palette_checkbox
+        gr.update(visible=tiles_visible, value=tile_budget_value),  # tile_budget_number
+        gr.update(visible=is_logo),                                # logo_subtype_radio
+        gr.update(visible=is_artistic),                            # effects_accordion
+    )
+
+
+def on_mode_change_lock_logo_size(mode):
+    """GB Studio: Logo locks size to the fixed 160x144 GB screen automatically."""
+    if mode == MODE_LOGO:
+        return False, 160, 144
+    return gr.update(), gr.update(), gr.update()
 
 
 def create_gradio_interface():
     header = '<script async defer data-website-id="f5b8324e-09b2-4d56-8c1f-40a1f1457023" src="https://metrics.prodigle.dev/umami.js"></script><script type="module" data-entity="gameboy-image-converter" src="https://analytics.prodigle.dev/script.js"></script>'
     with gr.Blocks(head=header) as demo:
+        original_width_state = gr.State(0)
+        original_height_state = gr.State(0)
+
         with gr.Row():
             with gr.Column():
                 with gr.Row():
                     image_input = gr.Image(type="pil", label="Input Image")
                     folder_input = gr.File(label="Input Folder", file_count='directory')
+
+                mode_radio = gr.Radio(
+                    choices=[MODE_ARTISTIC, MODE_COLOR, MODE_MONO, MODE_LOGO],
+                    value=MODE_ARTISTIC,
+                    label="Mode",
+                )
+
                 with gr.Row():
                     new_width = gr.Number(label="Width", value=160)
                     new_height = gr.Number(label="Height", value=144)
                     keep_aspect_ratio = gr.Checkbox(label="Keep Aspect Ratio", value=False)
                 with gr.Row():
-                    logo_resolution = gr.Button("Use Logo Resolution")
+                    gb_screen_resolution = gr.Button("GB Screen (160x144)")
                     original_resolution = gr.Button("Use Original Resolution(Image)")
-                with gr.Row():
-                    enable_color_limit = gr.Checkbox(label="Limit number of Colors", value=True)
-                    number_of_colors = gr.Slider(label="Target Number of colors (32 max for GB Studio)", minimum=2, maximum=64, step=1, value=4)
-                    limit_4_colors_per_tile = gr.Checkbox(label="Limit to 4 colors per tile, 8 palettes (For GB Studio development only)",
-                                                          value=False, visible=True)
-                with gr.Group():
+
+                with gr.Group(visible=True) as artistic_panel:
                     with gr.Row():
-                        reduce_tile_checkbox = gr.Checkbox(label="Reduce to 192 unique 8x8 tiles (Not needed for LOGO scene mode)", value=False)
-                        use_tile_variance_checkbox = gr.Checkbox(label="Sort by tile complexity (Complex tiles get saved first)", value=False)
-                    reduce_tile_similarity_threshold = gr.Slider(label="Tile similarity threshold", minimum=0.3,
-                                                                 maximum=0.99, value=0.8, step=0.01, visible=False)
-                with gr.Row():
-                    quantization_method = gr.Dropdown(choices=list(QUANTIZATION_METHODS.keys()),
-                                                      label="Quantization Method", value="libimagequant")
-                    dither_method = gr.Dropdown(choices=list(DITHER_METHODS.keys()), label="Dither Method",
-                                                value="None")
+                        enable_color_limit = gr.Checkbox(label="Limit number of Colors", value=True)
+                        number_of_colors = gr.Slider(label="Target Number of colors (32 max for GB Studio)",
+                                                     minimum=2, maximum=64, step=1, value=4)
+                    with gr.Row():
+                        quantization_method = gr.Dropdown(choices=list(QUANTIZATION_METHODS.keys()),
+                                                          label="Quantization Method", value="libimagequant")
+                        artistic_dither_method = gr.Dropdown(choices=list(DITHER_METHODS.keys()),
+                                                             label="Dither Method", value="None")
+
+                with gr.Group(visible=False) as hardware_panel:
+                    with gr.Row():
+                        reserve_ui_palette_checkbox = gr.Checkbox(
+                            label="Reserve palette 8 for dialogue/UI", value=True)
+                        hw_dither_method = gr.Dropdown(choices=list(HW_DITHER_METHODS.keys()),
+                                                       label="Dither Method", value="None")
+                    tile_budget_number = gr.Number(label="Tile budget", value=384, precision=0)
+                    logo_subtype_radio = gr.Radio(choices=["Color", "Mono"], value="Color",
+                                                  label="Logo Palette Type", visible=False)
+
                 with gr.Group():
                     use_custom_palette = gr.Checkbox(label="Use Custom Color Palette", value=True)
-                    palette_image = gr.Image(label="Color Palette Image", type="pil", visible=True,
+                    palette_image = gr.Image(label="Color Palette Image (custom palette / mono ramp)",
+                                             type="pil", visible=True,
                                              value=os.path.join(os.path.dirname(__file__), "gb_palette.png"))
-                with gr.Accordion("Gothic Filter (Experimental)", open=False):
-                    enable_gothic_filter = gr.Checkbox(label="Enable Gothic Filter", value=False)
-                    brightness_threshold = gr.Slider(label="Brightness Threshold", minimum=0, maximum=255, value=0,
-                                                     step=1)
-                    dot_size = gr.Slider(label="Dot Size", minimum=0.25, maximum=6, value=1, step=0.25)
-                    spacing = gr.Slider(label="Spacing", minimum=0, maximum=10, value=1, step=1)
-                    contrast_boost = gr.Slider(label="Contrast Boost", minimum=1.0, maximum=2.0, value=1.5, step=0.1)
-                    noise_factor = gr.Slider(label="Noise Factor", minimum=0, maximum=1, value=0.5, step=0.05)
-                    edge_enhance = gr.Checkbox(label="Edge Enhancement", value=False)
-                    apply_blur = gr.Checkbox(label="Apply Blur", value=False)
-                    irregular_shape = gr.Checkbox(label="Irregular Dot Shape", value=False)
-                    irregular_size = gr.Checkbox(label="Irregular Dot Size", value=False)
-                is_grayscale = gr.Checkbox(label="Convert to Grayscale", value=False)
-                with gr.Row():
-                    is_black_and_white = gr.Checkbox(label="Convert to Black and White", value=False)
-                    black_and_white_threshold = gr.Slider(label="Black and White Threshold", minimum=0, maximum=255,
-                                                          value=128, visible=False)
 
+                with gr.Accordion("Effects (Artistic only)", open=False, visible=True) as effects_accordion:
+                    with gr.Accordion("Gothic Filter (Experimental)", open=False):
+                        enable_gothic_filter = gr.Checkbox(label="Enable Gothic Filter", value=False)
+                        brightness_threshold = gr.Slider(label="Brightness Threshold", minimum=0, maximum=255,
+                                                         value=0, step=1)
+                        dot_size = gr.Slider(label="Dot Size", minimum=0.25, maximum=6, value=1, step=0.25)
+                        spacing = gr.Slider(label="Spacing", minimum=0, maximum=10, value=1, step=1)
+                        contrast_boost = gr.Slider(label="Contrast Boost", minimum=1.0, maximum=2.0, value=1.5, step=0.1)
+                        noise_factor = gr.Slider(label="Noise Factor", minimum=0, maximum=1, value=0.5, step=0.05)
+                        edge_enhance = gr.Checkbox(label="Edge Enhancement", value=False)
+                        apply_blur = gr.Checkbox(label="Apply Blur", value=False)
+                        irregular_shape = gr.Checkbox(label="Irregular Dot Shape", value=False)
+                        irregular_size = gr.Checkbox(label="Irregular Dot Size", value=False)
+                    is_grayscale = gr.Checkbox(label="Convert to Grayscale", value=False)
+                    with gr.Row():
+                        is_black_and_white = gr.Checkbox(label="Convert to Black and White", value=False)
+                        black_and_white_threshold = gr.Slider(label="Black and White Threshold", minimum=0,
+                                                              maximum=255, value=128, visible=False)
 
-                is_black_and_white.change(lambda x: gr.update('black_and_white_threshold', visible=x),
-                                          inputs=[is_black_and_white], outputs=[black_and_white_threshold])
-
-                # Logic to capture and display original image dimensions
-                def capture_original_dimensions(image):
-                    # Update the global variables with the dimensions of the uploaded image
-                    if image is None:
-                        return None
-                    width, height = image.size
-                    original_width.value = width
-                    original_height.value = height
-                    return image  # Return unchanged image for further processing
-
-                def limit_4_colors_per_tile_change(x):
-                    quantize_for_GBC.value = x
-                    return quantize_for_GBC.value
-
-
-                limit_4_colors_per_tile.change(limit_4_colors_per_tile_change, inputs=[limit_4_colors_per_tile])
-
-                def on_use_tile_variance_click(x):
-                    use_tile_variance.value = x
-                    return x
-
-                use_tile_variance_checkbox.change(on_use_tile_variance_click, inputs=[use_tile_variance_checkbox])
+                is_black_and_white.change(lambda x: gr.update(visible=x),
+                                         inputs=[is_black_and_white], outputs=[black_and_white_threshold])
 
                 image_input.change(
                     fn=capture_original_dimensions,
                     inputs=[image_input],
-                    outputs=[image_input]
+                    outputs=[image_input, original_width_state, original_height_state],
                 )
 
-                def on_logo_resolution_click():
-                    # Return the values you want to update in the UI components
-                    # No need to call .update() on individual components here, just return the new values
-                    return False, 160, 144
-
-                # In the logo_resolution button click setup,
-                # Ensure you're mapping the outputs of the function to the correct UI elements
-                logo_resolution.click(
-                    fn=on_logo_resolution_click,
-                    outputs=[keep_aspect_ratio, new_width, new_height]
-                    # The outputs should correspond to the UI components you want to update
+                gb_screen_resolution.click(
+                    fn=on_gb_screen_click,
+                    outputs=[keep_aspect_ratio, new_width, new_height],
                 )
-
-                def on_original_resolution_click():
-                    return False, original_width.value, original_height.value
 
                 original_resolution.click(
                     fn=on_original_resolution_click,
-                    outputs=[keep_aspect_ratio, new_width, new_height]
+                    inputs=[original_width_state, original_height_state],
+                    outputs=[keep_aspect_ratio, new_width, new_height],
                 )
 
-                # Dynamic updates based on aspect ratio checkbox and width changes
                 keep_aspect_ratio.change(
                     fn=adjust_for_aspect_ratio,
-                    inputs=[keep_aspect_ratio, new_width, new_height],
-                    outputs=[new_width, new_height]
+                    inputs=[keep_aspect_ratio, new_width, new_height, original_width_state, original_height_state],
+                    outputs=[new_width, new_height],
                 )
                 new_width.change(
                     fn=adjust_for_aspect_ratio,
-                    inputs=[keep_aspect_ratio, new_width, new_height],
-                    outputs=[new_width, new_height]
+                    inputs=[keep_aspect_ratio, new_width, new_height, original_width_state, original_height_state],
+                    outputs=[new_width, new_height],
                 )
+
+                mode_change_outputs = [artistic_panel, hardware_panel, reserve_ui_palette_checkbox,
+                                       tile_budget_number, logo_subtype_radio, effects_accordion]
+                mode_radio.change(fn=on_mode_or_logo_change, inputs=[mode_radio, logo_subtype_radio],
+                                  outputs=mode_change_outputs)
+                logo_subtype_radio.change(fn=on_mode_or_logo_change, inputs=[mode_radio, logo_subtype_radio],
+                                         outputs=mode_change_outputs)
+                mode_radio.change(fn=on_mode_change_lock_logo_size, inputs=[mode_radio],
+                                  outputs=[keep_aspect_ratio, new_width, new_height])
 
             with gr.Column():
                 with gr.Group():
@@ -1070,683 +1341,26 @@ def create_gradio_interface():
                     execute_button_folder = gr.Button("Convert Folder")
                 image_output_zip = gr.File(label="Output Folder Zip", type="filepath")
 
-        reduce_tile_checkbox.change(lambda x: gr.update('reduce_tile_checkbox', visible=x),
-                                    inputs=[reduce_tile_checkbox], outputs=[reduce_tile_similarity_threshold])
-
-        use_custom_palette.change(lambda x: gr.update('palette_image', visible=x),
+        use_custom_palette.change(lambda x: gr.update(visible=x),
                                   inputs=[use_custom_palette], outputs=[palette_image])
 
-        def extract_tiles(image, tile_size=(8, 8)):
-            """Extract 8x8 tiles from the image."""
-            tiles = []
-            for y in range(0, image.height, tile_size[1]):
-                for x in range(0, image.width, tile_size[0]):
-                    box = (x, y, x + tile_size[0], y + tile_size[1])
-                    tiles.append(image.crop(box))
-            return tiles
-
-        def generate_palette(tile, num_colors=4):
-            """Generate a 4-color palette for an 8x8 tile using K-means clustering.
-
-            Args:
-                tile: The input tile as a PIL image or a NumPy array.
-                num_colors: The number of colors to include in the palette.
-
-            Returns:
-                A NumPy array representing the palette, with each color as a row.
-            """
-            # Ensure the input is a NumPy array and has the correct shape
-            if not isinstance(tile, np.ndarray):
-                tile = np.array(tile)
-            if tile.shape[0] * tile.shape[1] < num_colors:
-                raise ValueError("Tile is too small for the number of colors requested")
-
-            # Reshape the tile data for K-means clustering
-            data = tile.reshape((-1, 3))
-
-            # Perform K-means clustering to find the dominant colors
-            kmeans = KMeans(n_clusters=num_colors, random_state=0).fit(data)
-            palette = kmeans.cluster_centers_.round().astype(
-                int)  # Round before converting to int for more accurate colors
-
-
-            return palette
-
-        def get_color_distribution(tile):
-            """
-            Analyzes the tile and returns a frequency distribution of its colors.
-            """
-            # Flatten the tile to a list of colors
-            data = tile.reshape(-1, 3)
-            # Count the frequency of each color
-            colors, counts = np.unique(data, axis=0, return_counts=True)
-            # Create a normalized distribution (frequency)
-            total = counts.sum()
-            distribution = {tuple(color): count / total for color, count in zip(colors, counts)}
-            return distribution
-
-        import numpy as np
-        from scipy.stats import wasserstein_distance
-
-        import numpy as np
-        from scipy.stats import wasserstein_distance
-        from sklearn.metrics import pairwise_distances
-
-        import numpy as np
-        from sklearn.metrics import pairwise_distances
-
-        def find_best_matching_palette(tile_distribution, existing_palettes, adjacent_distributions=None,
-                                       balance_factor=0.5, key_color_weight=1):
-            """
-            Enhanced palette matching considering color distribution, adjacent tiles, balance between local and global harmony, and key colors.
-            Args:
-                tile_distribution (dict): Color distribution of the current tile.
-                existing_palettes (list): List of available palettes to choose from.
-                adjacent_distributions (list): List of color distributions from adjacent tiles.
-                balance_factor (float): Balances between matching the tile's own colors and blending with adjacent tiles.
-                key_color_weight (float): Additional weight given to key colors to ensure their presence in the selected palette.
-            Returns:
-                int: Index of the best matching palette.
-            """
-            best_score = float('inf')
-            best_palette_index = None
-            # Define key colors that need special attention (e.g., white, black, skin tones)
-            key_colors = [(255, 255, 255), (0, 0, 0)]  # White and black
-
-            # Iterate through each candidate palette
-            for palette_index, palette in enumerate(existing_palettes):
-                palette_colors = np.array(palette)
-                tile_score = 0
-
-                # Calculate how well the palette matches the tile's own color distribution
-                for color, frequency in tile_distribution.items():
-                    distances = pairwise_distances([color], palette_colors, metric='euclidean')[0]
-                    closest_distance = np.min(distances)
-                    # Apply additional weight to key colors
-                    weight = key_color_weight if color in key_colors else 1
-                    tile_score += frequency * closest_distance * weight
-
-                # Context-aware selection: consider adjacent tiles if available
-                context_score = 0
-                if adjacent_distributions:
-                    for adj_dist in adjacent_distributions:
-                        adj_score = 0
-                        for adj_color, adj_freq in adj_dist.items():
-                            distances = pairwise_distances([adj_color], palette_colors, metric='euclidean')[0]
-                            closest_distance = np.min(distances)
-                            # Apply additional weight to key colors in adjacent tiles
-                            weight = key_color_weight if adj_color in key_colors else 1
-                            adj_score += adj_freq * closest_distance * weight
-                        context_score += adj_score  # Accumulate context score from all adjacent tiles
-
-                    # Average the context score based on the number of adjacent tiles considered
-                    context_score /= len(adjacent_distributions)
-
-                # Combine tile score and context score using the balance factor
-                combined_score = (1 - balance_factor) * tile_score + balance_factor * context_score
-
-                # Update best palette if current one is better
-                if combined_score < best_score:
-                    best_score = combined_score
-                    best_palette_index = palette_index
-
-            return best_palette_index
-
-        import numpy as np
-        from PIL import Image
-
-        from PIL import Image
-        import numpy as np
-
-        from skimage.color import deltaE_ciede2000
-        from skimage.color import rgb2lab, lab2rgb
-        from skimage import color  # Import the color module from scikit-image
-        def apply_palette(tile, palette, dither=Image.Dither.NONE):
-            """
-            Apply a palette to a tile, optionally using dithering while respecting the palette entries.
-            """
-            if dither != Image.Dither.NONE:
-                if tile.mode != "RGB":
-                    tile = tile.convert("RGB")
-                palette_image = create_palette_from_colors(palette)
-                quantized_tile = tile.quantize(palette=palette_image, dither=dither)
-                return quantized_tile.convert("RGB")
-
-            tile_array = np.array(tile)
-            palette_array = np.array(palette)
-
-            # Convert tile and palette to LAB color space
-            tile_lab = rgb2lab(tile_array)
-            palette_lab = rgb2lab(palette_array[np.newaxis, :, :])
-
-            # Expand dimensions for broadcasting
-            tile_lab_expanded = tile_lab[:, :, np.newaxis, :]
-
-            # Calculate color distances in a vectorized manner
-            distances = np.linalg.norm(tile_lab_expanded - palette_lab, axis=3)
-
-            # Find the index of the closest palette color for each pixel
-            closest_palette_indices = np.argmin(distances, axis=2)
-
-            # Map the tile to the new palette using advanced indexing
-            new_tile_array = palette_array[closest_palette_indices]
-
-            # Convert back to PIL Image
-            new_tile = Image.fromarray(np.uint8(new_tile_array), 'RGB')
-            return new_tile
-
-        from skimage.color import rgb2lab, lab2rgb
-        from sklearn.cluster import MiniBatchKMeans
-        import numpy as np
-        import random
-        from skimage.color import lab2rgb
-        from sklearn.metrics.pairwise import euclidean_distances
-
-        import itertools
-
-        from skimage.color import lab2rgb, rgb2lab
-        import numpy as np
-        from PIL import Image
-
-        import numpy as np
-        from skimage.color import lab2rgb, rgb2lab
-
-        import numpy as np
-        from skimage.color import lab2rgb, rgb2lab
-        from PIL import Image
-
-        def create_refined_palettes(cluster_centers, tiles, num_palettes=8, colors_per_palette=4):
-            # Flatten and convert LAB color arrays to RGB, then clip and convert to integers.
-            flat_cluster_centers = np.vstack(cluster_centers)
-            cluster_centers_rgb = (np.clip(lab2rgb(flat_cluster_centers), 0, 1) * 255).astype(np.uint8)
-
-            # Initialize palettes and a list to keep track of color frequencies.
-            refined_palettes_rgb = [[] for _ in range(num_palettes)]
-            color_frequencies = np.zeros(len(cluster_centers_rgb), dtype=int)
-
-            # Calculate color frequencies based on their presence in tiles.
-            for tile in tiles:
-                lab_tile = rgb2lab(np.array(tile.convert('RGB'), dtype=np.float64) / 255).reshape(-1, 3)
-                for color in lab_tile:
-                    distances = np.linalg.norm(cluster_centers_rgb - color, axis=1)
-                    nearest_color_index = np.argmin(distances)
-                    color_frequencies[nearest_color_index] += 1
-
-            # Rank colors by frequency and distribute among palettes.
-            sorted_indices = np.argsort(-color_frequencies)
-            palette_counters = [0] * num_palettes
-            for color_index in sorted_indices:
-                least_filled_palette_index = palette_counters.index(min(palette_counters))
-                if palette_counters[least_filled_palette_index] < colors_per_palette:
-                    current_color = tuple(cluster_centers_rgb[color_index])
-                    if all(current_color != tuple(color) for color in refined_palettes_rgb[least_filled_palette_index]):
-                        refined_palettes_rgb[least_filled_palette_index].append(cluster_centers_rgb[color_index])
-                        palette_counters[least_filled_palette_index] += 1
-
-                if all(count == colors_per_palette for count in palette_counters):
-                    break
-
-            # Define function to calculate color distance outside of any loop
-            def color_distance(c1, c2):
-                return np.sqrt(np.sum((c1 - c2) ** 2))
-
-            # Calculate global color usage outside of the initial distribution loop
-            global_color_usage = {tuple(color): 0 for color in cluster_centers_rgb}
-            for palette in refined_palettes_rgb:
-                for color in palette:
-                    global_color_usage[tuple(color)] += 1
-
-            # Fill up any palettes that are short of colors, outside of the initial distribution loop
-            for palette_index, palette in enumerate(refined_palettes_rgb):
-                while len(palette) < colors_per_palette:
-                    best_color = None
-                    best_color_score = -np.inf  # Lower score is better; start with worst possible
-                    existing_colors_tuples = [tuple(color) for color in palette]
-
-                    for color in cluster_centers_rgb:
-                        color_tuple = tuple(color)  # Ensure color is a tuple for comparison
-                        if color_tuple not in existing_colors_tuples:  # Corrected comparison
-                            # Calculate color's overall score based on global usage and diversity
-                            usage_score = -global_color_usage[color_tuple]  # Prefer less used colors
-                            diversity_score = min(
-                                [color_distance(np.array(color), np.array(existing_color)) for existing_color in
-                                 palette] or [np.inf])  # Prefer colors different from existing ones
-                            total_score = usage_score + diversity_score
-
-                            if total_score > best_color_score:
-                                best_color_score = total_score
-                                best_color = color
-
-                    if best_color is not None:
-                        refined_palettes_rgb[palette_index].append(best_color)
-                        global_color_usage[tuple(best_color)] += 1
-
-            return refined_palettes_rgb
-
-        from skimage.color import lab2rgb, rgb2lab
-        from sklearn.cluster import MiniBatchKMeans
-        import numpy as np
-        from PIL import Image
-
-        def analyze_and_construct_palettes(tiles, max_palettes=8, max_colors=32, local_influence=0.5):
-            # Extract unique colors from all tiles
-            unique_colors_set = set()
-            for tile in tiles:
-                rgb_tile = np.array(tile.convert('RGB'), dtype=np.uint8)  # Convert each PIL Image tile to a NumPy array
-                unique_colors = set(tuple(color) for row in rgb_tile for color in row)
-                unique_colors_set.update(unique_colors)
-
-            # Determine the actual number of clusters based on unique colors in the image
-            num_unique_colors = len(unique_colors_set)
-            num_clusters = min(max_colors, num_unique_colors)  # Adjust number of clusters based on unique colors
-
-            # Convert PIL Images to LAB and perform clustering as before
-            lab_tiles = [rgb2lab(np.array(tile.convert('RGB'), dtype=np.float64) / 255) for tile in tiles]
-            all_tiles_lab = np.vstack([tile.reshape(-1, 3) for tile in lab_tiles])
-
-            global_kmeans = MiniBatchKMeans(n_clusters=num_clusters, random_state=42)
-            global_kmeans.fit(all_tiles_lab)
-            # The rest of your function continues as before...
-
-            broad_palette_lab = global_kmeans.cluster_centers_
-
-            # Compute global color weights
-            global_labels = global_kmeans.labels_
-            global_color_weights = np.bincount(global_labels, minlength=num_clusters) / float(len(global_labels))
-
-            # Adjust global color weights based on local tile colors
-            for tile_lab in lab_tiles:
-                local_labels = global_kmeans.predict(tile_lab.reshape(-1, 3))
-                local_color_weights = np.bincount(local_labels, minlength=num_clusters) / float(len(local_labels))
-                global_color_weights = (
-                                                   1 - local_influence) * global_color_weights + local_influence * local_color_weights
-
-            # Fallback for zero weights
-            if not np.any(global_color_weights):
-                global_color_weights = np.ones_like(global_color_weights) / len(global_color_weights)
-
-            # Apply weights to determine final color selection
-            weighted_colors = np.repeat(broad_palette_lab, np.maximum(global_color_weights.astype(int), 1), axis=0)
-
-            # Ensure there are weighted colors to fit
-            if weighted_colors.size == 0:
-                weighted_colors = broad_palette_lab
-
-            # Perform final KMeans clustering to determine refined palettes
-            # Cap colors at max_palettes * 4 to ensure GB Studio compatibility (8 palettes × 4 colors = 32 max)
-            final_kmeans = MiniBatchKMeans(n_clusters=min(max_colors, max_palettes * 4), random_state=42)
-            final_kmeans.fit(weighted_colors)
-
-            # Construct refined palettes
-            refined_palettes_lab = [final_kmeans.cluster_centers_[i:i + 4] for i in
-                                    range(0, len(final_kmeans.cluster_centers_), 4)]
-            refined_palettes_rgb = create_refined_palettes(refined_palettes_lab, tiles)
-
-            return refined_palettes_rgb
-
-        def process_tiles(tiles, max_palettes=8, tile_width=8, tile_height=8, image_width=None, num_colors=4, dither_method=Image.Dither.NONE, enhanced_palettes=None):
-            """Process the tiles to limit them to the best 4-color palettes, based on global analysis and frequency."""
-            # Step 1: Generate enhanced palettes considering the whole image
-            tile_palette_mapping = []
-            if not enhanced_palettes:
-                enhanced_palettes = analyze_and_construct_palettes(tiles, max_palettes, num_colors)
-
-            # Calculate the number of tiles per row if image width is known
-            tiles_per_row = image_width // tile_width if image_width else None
-
-            # Initialize list to hold the best palette for each tile
-            tile_palettes = []
-            palette_for_tile_text = ""
-            # Step 2: Assign each tile the most suitable enhanced palette, considering adjacent tiles
-            for index, tile in enumerate(tiles):
-                closest_palette_index = None
-                np_tile = np.array(tile)
-                tile_distribution = get_color_distribution(np_tile)
-
-                # Gather distributions from adjacent tiles if possible
-                adjacent_distributions = []
-                if tiles_per_row:  # If the layout of tiles is known
-                    # Determine the positions of adjacent tiles
-                    positions = [(0, -1), (0, 1), (-1, 0), (1, 0)]  # (dy, dx) pairs for up, down, left, right
-                    for dy, dx in positions:
-                        adj_index = index + dy * tiles_per_row + dx
-                        # Check if adjacent index is valid and within the same row/column as appropriate
-                        if 0 <= adj_index < len(tiles) and (
-                                dy == 0 or (index // tiles_per_row == adj_index // tiles_per_row)):
-                            adjacent_tile = tiles[adj_index]
-                            adj_distribution = get_color_distribution(np.array(adjacent_tile))
-                            adjacent_distributions.append(adj_distribution)
-
-                # Find the closest enhanced palette to the original tile palette, considering adjacent tiles
-                closest_palette_index = find_best_matching_palette(tile_distribution, enhanced_palettes,
-                                                                  adjacent_distributions)
-
-                tile_palettes.append(closest_palette_index)
-                x,y = index % tiles_per_row, index // tiles_per_row
-                palette_for_tile_text += f"Tile at ({x},{y}) uses palette {closest_palette_index + 1}\n"
-                tile_palette_mapping.append(closest_palette_index)
-
-            # Step 3: Apply the selected palettes to each tile
-            processed_tiles = [
-                apply_palette(tiles[i], enhanced_palettes[tile_palettes[i]], dither=dither_method)
-                for i in range(len(tiles))
-            ]
-
-            return processed_tiles, enhanced_palettes, palette_for_tile_text, tile_palette_mapping
-
-        from PIL import Image
-
-        def replace_tile_palettes(img, custom_palette):
-            """
-            Apply a custom palette to each 8x8 tile in the image.
-            Each 8x8 tile will map its original color indexes directly to the custom palette indexes.
-
-            :param img: PIL Image to modify.
-            :param custom_palette: List of tuples, each representing an RGB color.
-            :return: PIL Image with the modified palette.
-            """
-            # Ensure the custom palette has exactly 4 colors
-            if len(custom_palette) != 4:
-                raise ValueError("Custom palette must have exactly 4 colors")
-
-            # Make into a PIL Image palette
-            custom_palette_image = create_palette_from_colors(custom_palette)
-
-            # Process each 8x8 tile
-            for y in range(0, img.height, 8):
-                for x in range(0, img.width, 8):
-                    tile = img.crop((x, y, x + 8, y + 8))
-                    tile = tile.convert('P')  # Convert to palette mode
-                    tile_data = list(tile.getdata())  # Convert data to list if it's not already
-                    new_tile = Image.new('P', (8, 8))
-                    new_tile.putpalette(custom_palette_image.getpalette())
-                    new_tile.putdata(tile_data)  # Use the data
-                    new_tile = new_tile.convert('RGB')  # Convert back to RGB
-
-                    # Paste the modified tile back into the image
-                    img.paste(new_tile, (x, y))
-
-            return img
-
-        def apply_mapped_colors_to_tile(tile, tile_palette, custom_palette_palette):
-            if tile.mode != "RGB":
-                tile = tile.convert("RGB", palette=Image.ADAPTIVE, dither=False)
-            # Create a new tile to avoid changing the original while iterating
-            new_tile = Image.new('RGB', tile.size)
-            pixels = tile.load()  # Load tile pixels for reading
-            new_pixels = new_tile.load()  # Load new tile pixels for writing
-
-            # Convert tile_palette to a list of tuples if it's not already, to avoid the ambiguous truth value error
-            tile_palette_tuples = [tuple(color) for color in tile_palette]
-            tile_palette_tuples = tuple(tile_palette_tuples)
-
-            for y in range(tile.size[1]):  # For each row in the tile
-                for x in range(tile.size[0]):  # For each column in the row
-                    original_color = pixels[x, y]
-                    original_color = tuple(original_color)
-                    if original_color in tile_palette_tuples:  # If the color is in the tile's palette
-                        # Find the index of the color in the original tile's palette
-                        color_index = tile_palette_tuples.index(original_color)
-                        # Find the new color from the custom palette using the same index
-                        new_color = custom_palette_palette[color_index]
-                        # Set the pixel in the new tile to the new color
-                        new_pixels[x, y] = new_color
-                    else:
-                        # If the color is not in the palette, keep it as is (or handle as needed)
-                        print(f"Color {original_color} not in palette")
-                        new_pixels[x, y] = original_color
-
-            return new_tile
-        def process_image(image, width, height, aspect_ratio, color_limit, num_colors, quant_method, dither_method,
-                          use_palette, custom_palette, grayscale, black_and_white, bw_threshold, reduce_tile_flag,
-                          reduce_tile_threshold, limit_4_colors_per_tile, enable_gothic_filter, brightness_threshold, dot_size, spacing, contrast_boost,
-                          noise_factor, edge_enhance, apply_blur, irregular_shape, irregular_size):
-            with task_log("process_image") as task_id:
-                if num_colors <= 4:
-                    limit_4_colors_per_tile = False
-                text_for_palette = ""
-                text_for_palette_tile_application = ""
-                if image.mode != "RGB":
-                    image = image.convert("RGB")
-                image = downscale_image(image, int(width), int(height), aspect_ratio)
-                notice = None
-                image_for_reference_palette = image.copy()
-                base_image: Image = image.copy()
-                quant_method_key = quant_method if quant_method in QUANTIZATION_METHODS else 'Median cut'
-                dither_method_key = dither_method if dither_method in DITHER_METHODS else 'None'
-                if color_limit:
-
-                    image_for_reference_palette: Image = image.copy()
-                    image_for_reference_palette = limit_colors(image_for_reference_palette, limit=num_colors,
-                                                               quantize=QUANTIZATION_METHODS[quant_method_key],
-                                                               dither=DITHER_METHODS[dither_method_key])
-                    image_for_reference_palette: Image = image_for_reference_palette.convert('RGB')
-
-                    palette_color_values = []
-                    enhanced_palettes = None
-                    tile_palette_mapping = None
-                if limit_4_colors_per_tile and not reduce_tile_flag:
-                    image_for_reference_palette: Image = image.copy()
-                    tiles = extract_tiles(image_for_reference_palette)
-                    processed_tiles, enhanced_palettes, text_for_palette_tile_application, tile_palette_mapping = process_tiles(
-                        tiles,
-                        8,
-                        8,
-                        8,
-                        image_for_reference_palette.width,
-                        num_colors,
-                        dither_method=DITHER_METHODS[dither_method_key],
-                    )
-                    # Reconstruct the image from the processed tiles
-                    new_image = Image.new('RGB', image_for_reference_palette.size)
-                    tile_index = 0
-                    for y in range(0, image_for_reference_palette.height, 8):
-                        for x in range(0, image_for_reference_palette.width, 8):
-                            new_image.paste(processed_tiles[tile_index], (x, y))
-                            tile_index += 1
-                    image_for_reference_palette = new_image
-                    for palette in enhanced_palettes:
-                        palette_color_values.append(
-                            [f"#{color[0]:02x}{color[1]:02x}{color[2]:02x}" for color in palette])
-                else:
-                    palette_colors = image_for_reference_palette.getcolors(maxcolors=num_colors)
-                    if palette_colors is None:
-                        palette_colors = image_for_reference_palette.quantize(colors=num_colors).convert('RGB').getcolors(maxcolors=num_colors)
-                    palette_colors = [color for count, color in palette_colors]
-                    palette_color_values = [
-                        "#{0:02x}{1:02x}{2:02x}".format(*color) for color in palette_colors
-                    ]
-
-                if use_palette and custom_palette is not None:
-                    if quantize_for_GBC and quantize_for_GBC.value == True and not reduce_tile_flag:
-                        if limit_4_colors_per_tile:
-                            image = image_for_reference_palette.copy()
-                            if not enhanced_palettes or not tile_palette_mapping:
-                                processed_tiles, enhanced_palettes, text_for_palette_tile_application, tile_palette_mapping = process_tiles(
-                                    extract_tiles(image),
-                                    8,
-                                    8,
-                                    8,
-                                    image_for_reference_palette.width,
-                                    num_colors,
-                                    dither_method=DITHER_METHODS[dither_method_key],
-                                )
-                            custom_palette = custom_palette.quantize(colors=num_colors,
-                                                                     method=QUANTIZATION_METHODS[quant_method_key],
-                                                                     dither=DITHER_METHODS[dither_method_key])
-                            if image.mode != "P":
-                                image = image.convert("P", palette=Image.ADAPTIVE, dither=False if dither_method_key == "None" else True)
-                            image_tiles = processed_tiles
-                            # Ensure the custom_palette_palette is a list of RGB tuples
-                            custom_palette_palette = custom_palette.getpalette()
-                            custom_palette_palette = [(r, g, b) for r, g, b in
-                                                      zip(custom_palette_palette[0::3], custom_palette_palette[1::3],
-                                                          custom_palette_palette[2::3])]
-
-                            mapped_image = Image.new('RGB', image.size)
-                            for index, tile in enumerate(image_tiles):
-                                tile_palette = enhanced_palettes[tile_palette_mapping[index]]
-                                # No change needed here to mapped_colors because we're doing pixel-wise color replacement now
-                                # Apply new colors to the tile based on the mapping
-                                recolored_tile = apply_mapped_colors_to_tile(tile, tile_palette, custom_palette_palette)
-                                # Paste the recolored tile back into the image
-                                mapped_image.paste(recolored_tile,
-                                            (index % (image.width // 8) * 8, index // (image.width // 8) * 8))
-                            image = mapped_image
-                        else:
-                            image = image_for_reference_palette.copy()
-                            image = limit_colors(image, limit=num_colors, quantize=QUANTIZATION_METHODS[quant_method_key],
-                                             dither=DITHER_METHODS[dither_method_key], palette_image=custom_palette)
-                            image
-
-                    else:
-                        image = limit_colors(image, limit=num_colors, quantize=QUANTIZATION_METHODS[quant_method_key],
-                                             dither=DITHER_METHODS[dither_method_key], palette_image=custom_palette)
-                else:
-                    image = limit_colors(image, limit=num_colors, quantize=QUANTIZATION_METHODS[quant_method_key],
-                                         dither=DITHER_METHODS[dither_method_key])
-                if reduce_tile_flag and limit_4_colors_per_tile:
-                    #image = image_for_reference_palette.copy()
-                    # Apply our custom_palette to the image, without quantising, just the palette
-                    image = image_for_reference_palette.copy()
-                    image = limit_colors(image, limit=num_colors, quantize=QUANTIZATION_METHODS[quant_method_key],
-                                         dither=DITHER_METHODS[dither_method_key])
-                    custom_palette_info = custom_palette.getcolors()
-                    # just keep the tuple colours
-                    for i in range(len(custom_palette_info)):
-                        custom_palette_info[i] = custom_palette_info[i][1]
-                    enhanced_palettes = analyze_and_construct_palettes(extract_tiles(image), max_palettes=8, max_colors=min(num_colors, 32))
-                    # REMOVED: Early tile reduction - moved to after all palette processing
-                    # image, notice = reduce_tiles_index(image, similarity_threshold=reduce_tile_threshold, custom_palette_colors=custom_palette_info)
-                    image = image.convert("RGB")
-                    tiles = extract_tiles(image)
-                    processed_tiles, enhanced_palettes, text_for_palette_tile_application, tile_palette_mapping = process_tiles(
-                        tiles,
-                        8,
-                        8,
-                        8,
-                        image_for_reference_palette.width,
-                        len(image.getcolors()),
-                        dither_method=DITHER_METHODS[dither_method_key],
-                        enhanced_palettes=enhanced_palettes,
-                    )
-
-                    if use_custom_palette:
-                        image_tiles = processed_tiles
-                        mapped_image = Image.new('RGB', image.size)
-                        for index, tile in enumerate(image_tiles):
-                            # add to reference image
-                            image_for_reference_palette.paste(tile, (index % (image.width // 8) * 8, index // (image.width // 8) * 8))
-                            tile_palette = enhanced_palettes[tile_palette_mapping[index]]
-                            # No change needed here to mapped_colors because we're doing pixel-wise color replacement now
-                            # Apply new colors to the tile based on the mapping
-                            recolored_tile = apply_mapped_colors_to_tile(tile, tile_palette, custom_palette_info)
-                            # Paste the recolored tile back into the image
-                            mapped_image.paste(recolored_tile,
-                                               (index % (image.width // 8) * 8, index // (image.width // 8) * 8))
-                        image = mapped_image
-                        palette_color_values = []
-                        for palette in enhanced_palettes:
-                            palette_color_values.append(
-                                [f"#{color[0]:02x}{color[1]:02x}{color[2]:02x}" for color in palette])
-                    
-                    # MOVED: Apply palette-aware tile reduction AFTER all palette processing is complete
-                    # This prevents palette changes from creating new tiles that exceed the limit
-                    # Uses palette awareness to preserve color assignments while enforcing tile limits
-                    image, notice = reduce_tiles_index_palette_aware(image, enhanced_palettes=enhanced_palettes, 
-                                                                   tile_palette_mapping=tile_palette_mapping,
-                                                                   similarity_threshold=reduce_tile_threshold, 
-                                                                   custom_palette_colors=custom_palette_info)
-                    image = image.convert("RGB")
-                elif reduce_tile_flag:
-                    image, notice = reduce_tiles(image, similarity_threshold=reduce_tile_threshold)
-                    image_for_reference_palette, notice = reduce_tiles_index(image_for_reference_palette, similarity_threshold=reduce_tile_threshold)
-
-                if enable_gothic_filter:
-                    # Apply the gothic filter after all other processing
-                    image = apply_gothic_filter(image, brightness_threshold, dot_size, spacing, contrast_boost,
-                                                edge_enhance, noise_factor, apply_blur, irregular_shape, irregular_size)
-                    image_for_reference_palette = apply_gothic_filter(image_for_reference_palette, brightness_threshold, dot_size, spacing, contrast_boost,
-                                                                      edge_enhance, noise_factor, apply_blur, irregular_shape, irregular_size)
-
-                # Return all necessary components including the processed image and color values
-                # set pallete_color_values to exactly 4 values nomatter if there's less or more
-                for i in range(len(palette_color_values)):
-                    text_for_palette += f"Palette {i + 1}: {palette_color_values[i]}\n"
-                text_for_palette += f"\n\n{text_for_palette_tile_application}"
-
-                if image.mode != "RGB":
-                    image = image.convert("RGB")
-                if image_for_reference_palette.mode != "RGB":
-                    image_for_reference_palette = image_for_reference_palette.convert("RGB")
-
-                # Additional processing for grayscale and black & white
-                if grayscale:
-                    image = convert_to_grayscale(image)
-                if black_and_white:
-                    image = convert_to_black_and_white(image, threshold=bw_threshold)
-                
-                return image, text_for_palette, image_for_reference_palette, notice
-
-        def process_image_folder(input_files, width, height, aspect_ratio, color_limit, num_colors, quant_method, dither_method,
-                                 use_palette, custom_palette, grayscale, black_and_white, bw_threshold, reduce_tile_flag,
-                                    reduce_tile_threshold, limit_4_colors_per_tile, enable_gothic_filter, brightness_threshold, dot_size, spacing, contrast_boost,
-                                 noise_factor, edge_enhance, apply_blur, irregular_shape, irregular_size):
-            with task_log("process_image_folder") as task_id:
-                folder_name = "output_" + str(random.randint(0, 100000))
-            while os.path.exists(folder_name):
-                folder_name = "output_" + str(random.randint(0, 100000))
-            os.makedirs(folder_name)
-            try:
-                fileListing = []
-                text_for_palette = []
-                for index, file in enumerate(input_files):
-                    # if file is folder, skip
-                    if os.path.isdir(file.name):
-                        continue
-                    imageData = Image.open(file.name)
-                    result = process_image(imageData, width, height, aspect_ratio, color_limit, num_colors, quant_method, dither_method,
-                                           use_palette, custom_palette, grayscale, black_and_white, bw_threshold, reduce_tile_flag,
-                                           reduce_tile_threshold, limit_4_colors_per_tile, enable_gothic_filter, brightness_threshold, dot_size, spacing, contrast_boost,
-                                           noise_factor, edge_enhance, apply_blur, irregular_shape, irregular_size)
-                    result[0].save(os.path.join(folder_name, os.path.basename(input_files[index].name)))
-                    result[2].save(os.path.join(folder_name, os.path.basename(input_files[index].name).replace(".png", "_palette.png").replace(".jpg", "_palette.jpg")))
-                    text_for_palette.append(f"File {index + 1}: {os.path.basename(input_files[index].name)}\n{result[1]}")
-                # zip the folder
-                with zipfile.ZipFile(os.path.join(folder_name, folder_name + ".zip"), 'w') as zipf:
-                    for root, dirs, files in os.walk(folder_name):
-                        for file in files:
-                            if file != folder_name + ".zip":
-                                zipf.write(os.path.join(root, file), os.path.relpath(os.path.join(root, file), folder_name))
-                    # add the palette text to the zip
-                    zipf.writestr("palette_info.txt", "\n\n".join(text_for_palette))
-                return os.path.join(os.getcwd(), folder_name, folder_name + ".zip"), "\n\n".join(text_for_palette), None, None
-
-            except Exception as e:
-                os.system("rm -rf " + folder_name)
-                print(traceback.format_exc())
-                return None, "Error processing folder " + str(e), None, None
+        shared_inputs = [
+            new_width, new_height, keep_aspect_ratio,
+            enable_color_limit, number_of_colors, quantization_method, artistic_dither_method,
+            use_custom_palette, palette_image,
+            is_grayscale, is_black_and_white, black_and_white_threshold,
+            enable_gothic_filter, brightness_threshold, dot_size, spacing, contrast_boost,
+            noise_factor, edge_enhance, apply_blur, irregular_shape, irregular_size,
+            reserve_ui_palette_checkbox, hw_dither_method, tile_budget_number, logo_subtype_radio,
+        ]
 
         execute_button.click(run_in_task_executor(process_image),
-                             inputs=[image_input, new_width, new_height, keep_aspect_ratio, enable_color_limit,
-                                     number_of_colors, quantization_method, dither_method, use_custom_palette,
-                                     palette_image, is_grayscale, is_black_and_white, black_and_white_threshold,
-                                     reduce_tile_checkbox, reduce_tile_similarity_threshold, limit_4_colors_per_tile,
-                                     enable_gothic_filter, brightness_threshold, dot_size, spacing, contrast_boost,
-                                     noise_factor, edge_enhance, apply_blur, irregular_shape, irregular_size
-                                     ],
+                             inputs=[image_input, mode_radio] + shared_inputs,
                              outputs=[image_output, palette_text,
                                       image_output_no_palette, notice_text])
 
         execute_button_folder.click(run_in_task_executor(process_image_folder),
-                                    inputs=[folder_input, new_width, new_height, keep_aspect_ratio, enable_color_limit,
-                                            number_of_colors, quantization_method, dither_method, use_custom_palette,
-                                            palette_image, is_grayscale, is_black_and_white, black_and_white_threshold,
-                                            reduce_tile_checkbox, reduce_tile_similarity_threshold, limit_4_colors_per_tile,
-                                            enable_gothic_filter, brightness_threshold, dot_size, spacing,
-                                            contrast_boost,
-                                            noise_factor, edge_enhance, apply_blur, irregular_shape, irregular_size
-                                            ],
+                                    inputs=[folder_input, mode_radio] + shared_inputs,
                                     outputs=[image_output_zip, palette_text,
                                              image_output_no_palette, notice_text])
 
