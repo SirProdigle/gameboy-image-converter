@@ -558,3 +558,73 @@ def index_tiles(
         attrs_vflip=attrs_vflip,
         palettes=palettes,
     )
+
+
+# ---------------------------------------------------------------------------
+# Stage 5 -- lossless dedup
+# ---------------------------------------------------------------------------
+
+
+def dedup_patterns(gb: GBImage, allow_flips: bool) -> GBImage:
+    """Collapse exact-duplicate (and, if ``allow_flips``, flip-equivalent)
+    patterns down to a single stored copy, exactly as GB Studio's importer
+    (`tileData.ts`) hashes the 16-byte 2bpp pattern.
+
+    Iterates cells in raster order. Each cell's *effective* pattern (the
+    pattern it currently references, with any existing hflip/vflip already
+    applied) is hashed via ``pattern_to_2bpp``. On a miss the effective
+    pattern becomes a new canonical entry; when ``allow_flips`` its H/V/HV
+    variants are hashed too, so a later cell whose effective pattern exactly
+    matches one of them reuses that canonical pattern with the matching flip
+    bits set instead of minting a new one. Palette assignment is untouched --
+    this stage only shrinks `patterns` and remaps `tilemap` / flip attrs.
+    """
+    th, tw = gb.tilemap.shape
+    patterns_out: list = []
+    # 2bpp bytes -> (pattern index, hflip, vflip) needed to reproduce them.
+    variant_lookup: dict = {}
+    new_tilemap = np.zeros((th, tw), dtype=np.int32)
+    new_hflip = np.zeros((th, tw), dtype=bool)
+    new_vflip = np.zeros((th, tw), dtype=bool)
+
+    for tr in range(th):
+        for tc in range(tw):
+            src_idx = int(gb.tilemap[tr, tc])
+            pattern = gb.patterns[src_idx]
+            if gb.attrs_hflip[tr, tc]:
+                pattern = np.fliplr(pattern)
+            if gb.attrs_vflip[tr, tc]:
+                pattern = np.flipud(pattern)
+            key = pattern_to_2bpp(pattern)
+
+            if key in variant_lookup:
+                out_idx, fh, fv = variant_lookup[key]
+            else:
+                out_idx = len(patterns_out)
+                patterns_out.append(np.ascontiguousarray(pattern))
+                if allow_flips:
+                    for name, variant in pattern_variants(pattern).items():
+                        vkey = pattern_to_2bpp(variant)
+                        if vkey not in variant_lookup:
+                            variant_lookup[vkey] = (out_idx, "h" in name, "v" in name)
+                else:
+                    variant_lookup[key] = (out_idx, False, False)
+                fh, fv = False, False
+
+            new_tilemap[tr, tc] = out_idx
+            new_hflip[tr, tc] = fh
+            new_vflip[tr, tc] = fv
+
+    if patterns_out:
+        patterns_arr = np.stack(patterns_out).astype(np.uint8)
+    else:
+        patterns_arr = np.zeros((0, 8, 8), dtype=np.uint8)
+
+    return GBImage(
+        patterns=patterns_arr,
+        tilemap=new_tilemap,
+        attrs_palette=gb.attrs_palette.copy(),
+        attrs_hflip=new_hflip,
+        attrs_vflip=new_vflip,
+        palettes=gb.palettes,
+    )
