@@ -88,8 +88,10 @@ def test_verify_roundtrip_passes_inside_convert():
     assert isinstance(result, ConversionResult)
 
 
-def test_verify_roundtrip_detects_over_budget():
+def test_verify_roundtrip_reports_over_budget_count():
     # Build a GBImage whose rendered PNG has more unique tiles than the budget.
+    # verify_roundtrip no longer asserts on budget -- it RETURNS the true
+    # re-imported count so the caller can surface an over-budget warning.
     rng = np.random.RandomState(11)
     n = 12
     patterns = []
@@ -117,18 +119,22 @@ def test_verify_roundtrip_detects_over_budget():
     png = render(gb)
     tight = gb_pipeline.Preset("t", tile_budget=4, n_palettes=1,
                                allow_flips=False, mono=False, fixed_size=None)
-    with pytest.raises(AssertionError):
-        verify_roundtrip(png, tight, gb)
+    # 12 distinct rendered tiles, budget 4: returns 12 without raising.
+    n_reimport = verify_roundtrip(png, tight, gb)
+    assert n_reimport == n
+    assert n_reimport > tight.tile_budget
 
 
 def test_verify_roundtrip_independent_of_stored_indices():
     # Regression: two stored patterns that RENDER IDENTICALLY (one reaches a
     # color through a duplicate palette slot, the other through a single slot)
-    # must not trip verify. GB Studio's importer sees one tile, so an
+    # must re-import to ONE tile. GB Studio's importer sees one tile, so an
     # independent re-import (indices ranked by tile-local luminance) must too --
     # a verifier that instead reconstructs indices against the tile's assigned
     # palette would hash both to the same pattern yet still demand two, and the
     # old coupled implementation raised "reimport found 1 tiles, expected 2".
+    # verify_roundtrip now RETURNS the re-imported count; assert it collapses
+    # to fewer tiles than were stored.
     dark = snap_rgb555(np.array([16, 16, 16], dtype=np.uint8)).tolist()
     # Palette with a DUPLICATE dark entry at slots 2 and 3.
     palettes = snap_rgb555(
@@ -160,9 +166,10 @@ def test_verify_roundtrip_independent_of_stored_indices():
 
     preset = gb_pipeline.Preset("t", tile_budget=4, n_palettes=1,
                                 allow_flips=False, mono=False, fixed_size=None)
-    # Independent re-import collapses to one tile (1 <= 2 stored, 1 <= budget):
-    # must not raise.
-    verify_roundtrip(png, preset, gb)
+    # Independent re-import collapses to one tile, fewer than the 2 stored.
+    n_reimport = verify_roundtrip(png, preset, gb)
+    assert n_reimport == 1
+    assert n_reimport < gb.patterns.shape[0]
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +232,7 @@ def test_logo_already_correct_size_not_resized():
     image = _seeded_image(8, width=160, height=144)
     result = convert_for_hardware(image, "logo_color")
     assert result.image.size == (160, 144)
-    assert result.stats["tiles_used"] == 360  # no dedup for logo
+    assert result.stats["tiles_used"] == 360  # logo: sequential storage, no dedup
     assert not any("resized" in w for w in result.warnings)
 
 
@@ -266,13 +273,19 @@ def test_golden_counts_photo_like(photo_like_image):
     assert color.stats["palettes_used"] == GOLDEN["color_palettes"]
     assert mono.stats["tiles_used"] == GOLDEN["mono_tiles"]
     assert mono.stats["palettes_used"] == 1
-    assert logo.stats["tiles_used"] == 360
+    assert logo.stats["tiles_used"] == GOLDEN["logo_tiles"]
 
 
 # Golden values observed on the first green run; see test above. Regenerate
 # deliberately (and review the diff) only if the pipeline math changes.
 GOLDEN = {
-    "color_tiles": 357,     # 360 cells (20x18) deduped, under the 384 budget
+    # For color/mono, tiles_used is the independently verified (deduped)
+    # re-import count (spec Stage 7.2) -- the number of tiles GB Studio's
+    # importer would store, not the pipeline's internal pattern count. For logo,
+    # tiles are stored sequentially with no dedup, so tiles_used is the cell
+    # count (th*tw).
+    "color_tiles": 356,     # 360 cells (20x18) deduped, under the 384 budget
     "color_palettes": 7,    # reserve_ui_palette caps color at 7
-    "mono_tiles": 143,
+    "mono_tiles": 141,
+    "logo_tiles": 360,      # logo: sequential storage, no dedup (th*tw cells)
 }
