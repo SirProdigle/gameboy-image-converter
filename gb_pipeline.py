@@ -8,7 +8,7 @@ breakdown these functions implement.
 """
 
 import heapq
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 from PIL import Image
@@ -930,3 +930,303 @@ def merge_to_budget(gb: GBImage, budget: int, allow_flips: bool) -> tuple:
     result.merge_p95_delta_e = float(p95)
 
     return result, n_merges
+
+
+# ---------------------------------------------------------------------------
+# Stage 7 / Stage 8 -- verification, render, and the public entry point
+# ---------------------------------------------------------------------------
+#
+# `render` turns a GBImage back into an RGB PNG (index -> palette color, with
+# flip bits applied); `verify_roundtrip` re-imports that PNG with a
+# reimplementation of GB Studio's tile hashing and asserts the hardware
+# invariants hold; `convert_for_hardware` is the single public entry point that
+# runs the whole pipeline (downscale/crop -> quantize -> pack -> index -> dedup
+# -> budget merge -> verify -> render) and returns a ConversionResult.
+
+# p95 per-pixel Lab distance (from heavy budget merging) above which the result
+# gets an actionable quality warning.
+_HEAVY_MERGE_P95_DELTA_E = 12.0
+
+# Relative luminance weights, matching ``luminance_sort``.
+_LUM_WEIGHTS = np.array([2126.0, 7152.0, 722.0], dtype=np.float64)
+
+
+@dataclass
+class ConversionResult:
+    image: Image.Image            # final RGB render
+    reference: Image.Image        # render before budget merge (natural compare)
+    stats: dict                   # tiles_used, tile_budget, palettes_used,
+                                  # n_merges, p95_delta_e, preset, dither
+    warnings: list                # list[str]
+    palette_hex: list             # per palette, 4 hex strings
+
+
+def _pixel_luminance(rgb: np.ndarray) -> np.ndarray:
+    """Relative luminance of an (..., 3) RGB array (float, same lead shape)."""
+    rgb = np.asarray(rgb, dtype=np.float64)
+    return rgb @ _LUM_WEIGHTS
+
+
+def render(gb: GBImage) -> Image.Image:
+    """Render a GBImage to an RGB PIL image (the importable PNG).
+
+    Each cell places its pattern (flip bits applied) rendered through its
+    assigned palette, so the output contains only palette colors.
+    """
+    th, tw = gb.tilemap.shape
+    out = np.zeros((th * 8, tw * 8, 3), dtype=np.uint8)
+    palettes = np.asarray(gb.palettes, dtype=np.uint8)
+    for tr in range(th):
+        for tc in range(tw):
+            pattern = gb.patterns[int(gb.tilemap[tr, tc])]
+            if gb.attrs_hflip[tr, tc]:
+                pattern = np.fliplr(pattern)
+            if gb.attrs_vflip[tr, tc]:
+                pattern = np.flipud(pattern)
+            pal = palettes[int(gb.attrs_palette[tr, tc])]  # (4, 3)
+            out[tr * 8 : tr * 8 + 8, tc * 8 : tc * 8 + 8] = pal[pattern]
+    return Image.fromarray(out, "RGB")
+
+
+def _colors_to_indices(block: np.ndarray, palette: np.ndarray) -> np.ndarray:
+    """Map an (8, 8, 3) tile's pixels to palette indices by exact color match.
+
+    A pixel that equals several palette entries (duplicate colors in a padded
+    palette) takes the lowest such index -- mirroring how ``index_tiles``
+    resolves ties. Asserts every pixel matches some palette color.
+    """
+    block = np.asarray(block, dtype=np.uint8)
+    palette = np.asarray(palette, dtype=np.uint8)
+    idx = np.full(block.shape[:2], -1, dtype=np.int64)
+    for i in range(palette.shape[0]):
+        match = np.all(block == palette[i], axis=2) & (idx < 0)
+        idx[match] = i
+    assert idx.min() >= 0, "rendered pixel is not one of its palette colors"
+    return idx.astype(np.uint8)
+
+
+def _canonical_2bpp(pattern: np.ndarray, allow_flips: bool) -> bytes:
+    """2bpp bytes for a pattern, minimized over flip variants when allowed."""
+    if not allow_flips:
+        return pattern_to_2bpp(pattern)
+    return min(pattern_to_2bpp(v) for v in pattern_variants(pattern).values())
+
+
+def verify_roundtrip(png: Image.Image, preset: Preset, expected: GBImage) -> None:
+    """Independently re-import ``png`` and assert the hardware invariants.
+
+    Independent round-trip (spec Stage 7.2): crop each 8x8 tile, require <=4
+    unique colors, require every color to be RGB555-stable, recover the tile's
+    index pattern against its assigned palette and hash it as 2bpp
+    (canonicalizing flips when the preset allows them); assert the
+    reconstructed unique-tile count equals ``len(expected.patterns)`` and stays
+    within the tile budget (skipped for logo presets, whose tiles are stored
+    sequentially without dedup). Structural GBImage assertions (spec Stage 7.1):
+    the palette count is within ``preset.n_palettes`` and the stored palettes
+    are RGB555-only. Because every tile's pixels are matched exactly against
+    its assigned palette, a passing round-trip also proves each tile renders
+    from one of those <= n_palettes 4-color palettes.
+    """
+    arr = np.asarray(png.convert("RGB"), dtype=np.uint8)
+    th, tw = expected.tilemap.shape
+    assert arr.shape[0] == th * 8 and arr.shape[1] == tw * 8, "png size mismatch"
+
+    # Structural assertions on the GBImage itself (Stage 7.1).
+    assert expected.palettes.shape[0] <= preset.n_palettes, (
+        f"{expected.palettes.shape[0]} palettes exceeds limit {preset.n_palettes}"
+    )
+    assert np.array_equal(snap_rgb555(expected.palettes), expected.palettes), (
+        "stored palette is not RGB555-stable"
+    )
+
+    budget = preset.tile_budget
+    canon_hashes = set()
+    for tr in range(th):
+        for tc in range(tw):
+            block = arr[tr * 8 : tr * 8 + 8, tc * 8 : tc * 8 + 8]
+            uniq = np.unique(block.reshape(-1, 3), axis=0)
+            assert uniq.shape[0] <= 4, "tile has more than 4 colors"
+            assert np.array_equal(snap_rgb555(uniq), uniq), "color not RGB555-stable"
+
+            pal = expected.palettes[int(expected.attrs_palette[tr, tc])]
+            idx_pattern = _colors_to_indices(block, pal)
+            canon_hashes.add(_canonical_2bpp(idx_pattern, preset.allow_flips))
+
+    n_expected = int(expected.patterns.shape[0])
+    if budget is None:
+        # Logo: sequential storage, no dedup -- one stored tile per cell.
+        assert n_expected == th * tw, "logo tile count must equal cell count"
+    else:
+        assert len(canon_hashes) == n_expected, (
+            f"reimport found {len(canon_hashes)} tiles, expected {n_expected}"
+        )
+        assert len(canon_hashes) <= budget, "tile count exceeds budget"
+
+
+def _index_tiles_mono(
+    image: np.ndarray, palettes: np.ndarray, dither: str = "none"
+) -> GBImage:
+    """Index every pixel to the mono ramp by luminance rank (Stage 4, mono).
+
+    ``palettes`` is the (1, 4, 3) luminance-sorted ramp. Each pixel takes the
+    ramp entry nearest in luminance; with ``dither="bayer"`` it picks between
+    the two nearest ramp levels using the absolute-coordinate Bayer threshold.
+    """
+    if dither not in ("none", "bayer"):
+        raise ValueError(f"unknown dither mode: {dither!r}")
+    arr = np.asarray(image, dtype=np.uint8)
+    h, w = arr.shape[:2]
+    th, tw = h // 8, w // 8
+
+    ramp = np.asarray(palettes, dtype=np.uint8)[0]  # (4, 3)
+    ramp_lum = _pixel_luminance(ramp)               # (4,)
+    px_lum = _pixel_luminance(arr)                   # (h, w)
+
+    dist = np.abs(px_lum[:, :, None] - ramp_lum[None, None, :])  # (h, w, 4)
+    order = np.argsort(dist, axis=2, kind="stable")
+    idx1 = order[:, :, 0]
+    if dither == "bayer":
+        idx2 = order[:, :, 1]
+        d1 = np.take_along_axis(dist, idx1[:, :, None], axis=2)[:, :, 0]
+        d2 = np.take_along_axis(dist, idx2[:, :, None], axis=2)[:, :, 0]
+        denom = d1 + d2
+        t_val = np.where(denom > 0, d1 / np.where(denom > 0, denom, 1.0), 0.0)
+        yy = np.arange(h)[:, None]
+        xx = np.arange(w)[None, :]
+        thresh = BAYER4[yy % 4, xx % 4]
+        index = np.where(t_val > thresh, idx2, idx1)
+    else:
+        index = idx1
+
+    index = index.astype(np.uint8)
+    n_tiles = th * tw
+    patterns = np.zeros((n_tiles, 8, 8), dtype=np.uint8)
+    for tr in range(th):
+        for tc in range(tw):
+            patterns[tr * tw + tc] = index[tr * 8 : tr * 8 + 8, tc * 8 : tc * 8 + 8]
+
+    return GBImage(
+        patterns=patterns,
+        tilemap=np.arange(n_tiles, dtype=np.int32).reshape(th, tw),
+        attrs_palette=np.zeros((th, tw), dtype=np.uint8),
+        attrs_hflip=np.zeros((th, tw), dtype=bool),
+        attrs_vflip=np.zeros((th, tw), dtype=bool),
+        palettes=ramp[None, :, :].astype(np.uint8),
+    )
+
+
+def _palette_hex(palettes: np.ndarray) -> list:
+    """Per-palette list of 4 ``#RRGGBB`` hex strings."""
+    palettes = np.asarray(palettes, dtype=np.uint8)
+    return [
+        ["#{:02X}{:02X}{:02X}".format(int(c[0]), int(c[1]), int(c[2])) for c in pal]
+        for pal in palettes
+    ]
+
+
+def convert_for_hardware(
+    image: Image.Image,
+    preset: str,
+    *,
+    tile_budget: int | None = None,
+    reserve_ui_palette: bool = True,
+    dither: str = "none",
+    custom_palette: np.ndarray | None = None,
+    mono_ramp: np.ndarray | None = None,
+) -> ConversionResult:
+    """Convert ``image`` to a GB Studio-importable render for a named preset.
+
+    ``preset`` is a key of ``PRESETS``. Runs the full pipeline: RGB-convert,
+    crop to multiples of 8 (logo presets are resized to their fixed size),
+    quantize to a bounded working set, pack palettes, index tiles (mono uses
+    the ramp path), losslessly dedup (skipped for logo), lossily merge to the
+    tile budget (skipped for logo / no budget), then verify and render.
+    ``reserve_ui_palette`` reserves palette 8 for the dialogue/UI palette by
+    reducing an 8-palette color preset to 7. Returns a ConversionResult with
+    the final and pre-merge reference images, verified stats, warnings, and
+    per-palette hex swatches.
+    """
+    if preset not in PRESETS:
+        raise ValueError(f"unknown preset: {preset!r}")
+    ps = PRESETS[preset]
+    warnings: list = []
+
+    img = image.convert("RGB")
+    is_logo = ps.fixed_size is not None
+
+    # Crop down to multiples of 8 (notice if it changed anything).
+    ow, oh = img.size
+    nw, nh = (ow // 8) * 8, (oh // 8) * 8
+    if nw < 1 or nh < 1:
+        raise ValueError("image is smaller than one 8x8 tile")
+    if (nw, nh) != (ow, oh):
+        img = img.crop((0, 0, nw, nh))
+        warnings.append(
+            f"Input cropped from {ow}x{oh} to {nw}x{nh} "
+            "(dimensions must be multiples of 8)."
+        )
+
+    # Logo presets are locked to a fixed screen size.
+    if is_logo:
+        fw, fh = ps.fixed_size
+        if img.size != (fw, fh):
+            img = img.resize((fw, fh), Image.LANCZOS)
+            warnings.append(f"Input resized to {fw}x{fh} for the {ps.name} preset.")
+
+    # Effective palette budget: reserve palette 8 for color presets.
+    n_palettes = ps.n_palettes
+    if reserve_ui_palette and not ps.mono and n_palettes >= 8:
+        n_palettes -= 1
+
+    quantized = quantize_working_set(img, 4 * n_palettes, custom_palette)
+    arr = np.asarray(quantized, dtype=np.uint8)
+
+    if ps.mono:
+        ramp = DMG_RAMP if mono_ramp is None else np.asarray(mono_ramp, dtype=np.uint8)
+        palettes, _ = pack_palettes_mono(arr, ramp)
+        gb = _index_tiles_mono(arr, palettes, dither)
+    else:
+        palettes, assignment = pack_palettes(arr, n_palettes, custom_palette)
+        gb = index_tiles(arr, palettes, assignment, dither)
+
+    if not is_logo:
+        gb = dedup_patterns(gb, ps.allow_flips)
+
+    reference_gb = gb
+    reference_img = render(reference_gb)
+
+    budget = tile_budget if tile_budget is not None else ps.tile_budget
+    n_merges = 0
+    p95 = 0.0
+    if not is_logo and budget is not None:
+        gb, n_merges = merge_to_budget(gb, budget, ps.allow_flips)
+        p95 = float(getattr(gb, "merge_p95_delta_e", 0.0))
+
+    final_img = render(gb)
+
+    # Independent round-trip verification against the effective palette limit.
+    verify_roundtrip(final_img, replace(ps, n_palettes=n_palettes), gb)
+
+    if n_merges > 0 and p95 > _HEAVY_MERGE_P95_DELTA_E:
+        warnings.append(
+            f"Heavy tile merging (p95 dE ~ {p95:.1f}): raise the tile budget, "
+            "simplify the image, or disable dithering to reduce quality loss."
+        )
+
+    stats = {
+        "tiles_used": int(gb.patterns.shape[0]),
+        "tile_budget": budget,
+        "palettes_used": int(gb.palettes.shape[0]),
+        "n_merges": int(n_merges),
+        "p95_delta_e": p95,
+        "preset": ps.name,
+        "dither": dither,
+    }
+
+    return ConversionResult(
+        image=final_img,
+        reference=reference_img,
+        stats=stats,
+        warnings=warnings,
+        palette_hex=_palette_hex(gb.palettes),
+    )
