@@ -467,3 +467,94 @@ def pack_palettes(
     palettes_arr = np.stack(palettes).astype(np.uint8)  # (p, 4, 3)
     assignment = assign.reshape(th, tw).astype(np.uint8)
     return palettes_arr, assignment
+
+
+# ---------------------------------------------------------------------------
+# Stage 4 -- indexing + Bayer dither
+# ---------------------------------------------------------------------------
+
+BAYER4 = np.array(
+    [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]]
+) / 16.0
+
+
+def index_tiles(
+    image: np.ndarray,
+    palettes: np.ndarray,
+    assignment: np.ndarray,
+    dither: str = "none",
+) -> GBImage:
+    """Render each 8x8 tile against its assigned palette -> index patterns.
+
+    ``image`` is (H, W, 3) uint8 (already working-set/palette-limited);
+    ``palettes`` is (p, 4, 3) uint8 luminance-sorted (index 0 == lightest);
+    ``assignment`` is (H//8, W//8) uint8 palette id per cell.
+
+    For each pixel, finds the nearest palette entry in CIELAB -> index. With
+    ``dither="bayer"``, instead picks between the two nearest palette entries:
+    letting d1/d2 be the distances to the nearest/second-nearest entry,
+    t = d1/(d1+d2) (0 when the pixel is an exact palette color); the pixel
+    takes the second-nearest entry's index iff t exceeds the 4x4 ordered
+    Bayer threshold anchored to the pixel's *absolute* image coordinates.
+    No error diffusion -- dithering can never pick a color outside the
+    tile's assigned 4-color palette, and is position-stable (dedup-friendly).
+
+    Returns a GBImage with one pattern per tile cell (raster order), an
+    identity tilemap, no flips set, and ``palettes`` passed through unchanged.
+    Dedup (fewer patterns) is a later stage.
+    """
+    if dither not in ("none", "bayer"):
+        raise ValueError(f"unknown dither mode: {dither!r}")
+
+    arr = np.asarray(image, dtype=np.uint8)
+    h, w = arr.shape[:2]
+    th, tw = h // 8, w // 8
+    n_tiles = th * tw
+
+    palettes = np.asarray(palettes, dtype=np.uint8)
+    assignment = np.asarray(assignment)
+    pal_lab = np.stack([_rgb_to_lab(pp) for pp in palettes])  # (p, 4, 3)
+
+    patterns = np.zeros((n_tiles, 8, 8), dtype=np.uint8)
+    tilemap = np.arange(n_tiles, dtype=np.int32).reshape(th, tw)
+    attrs_hflip = np.zeros((th, tw), dtype=bool)
+    attrs_vflip = np.zeros((th, tw), dtype=bool)
+
+    row_off = np.arange(8)[:, None]
+    col_off = np.arange(8)[None, :]
+
+    for tr in range(th):
+        for tc in range(tw):
+            t = tr * tw + tc
+            block = arr[tr * 8 : tr * 8 + 8, tc * 8 : tc * 8 + 8]  # (8,8,3)
+            pid = int(assignment[tr, tc])
+            plab = pal_lab[pid]  # (4,3)
+            blab = _rgb_to_lab(block).reshape(8, 8, 3)
+            diff = blab[:, :, None, :] - plab[None, None, :, :]  # (8,8,4,3)
+            dist = np.sqrt(np.sum(diff * diff, axis=3))  # (8,8,4)
+            order = np.argsort(dist, axis=2, kind="stable")  # nearest-first
+            idx1 = order[:, :, 0]
+
+            if dither == "bayer":
+                idx2 = order[:, :, 1]
+                d1 = np.take_along_axis(dist, idx1[:, :, None], axis=2)[:, :, 0]
+                d2 = np.take_along_axis(dist, idx2[:, :, None], axis=2)[:, :, 0]
+                denom = d1 + d2
+                t_val = np.where(denom > 0, d1 / np.where(denom > 0, denom, 1.0), 0.0)
+                yy = tr * 8 + row_off
+                xx = tc * 8 + col_off
+                thresh = BAYER4[yy % 4, xx % 4]
+                index = np.where(t_val > thresh, idx2, idx1)
+            else:
+                index = idx1
+
+            patterns[t] = index.astype(np.uint8)
+
+    return GBImage(
+        patterns=patterns,
+        tilemap=tilemap,
+        attrs_palette=assignment.astype(np.uint8),
+        attrs_hflip=attrs_hflip,
+        attrs_vflip=attrs_vflip,
+        palettes=palettes,
+    )

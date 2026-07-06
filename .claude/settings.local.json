@@ -24,7 +24,9 @@
       "WebFetch(domain:hub.docker.com)",
       "Bash(docker search:*)",
       "Bash(docker login:*)",
-      "Bash(pip show:*)"
+      "Bash(pip show:*)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); [print\\(x['path']\\) for x in d.get\\('tree',[]\\)]\")",
+      "Bash(python3 -c ':*)"
     ],
     "deny": [],
     "ask": []
