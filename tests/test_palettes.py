@@ -219,3 +219,23 @@ def test_pack_palettes_mono_custom_ramp():
     arr = _flat_array()
     palettes, _ = pack_palettes_mono(arr, ramp)
     assert np.array_equal(palettes[0], luminance_sort(snap_rgb555(ramp)))
+
+
+def test_agglomerate_kmeans_call_budget(monkeypatch):
+    import gb_pipeline
+
+    calls = {"n": 0}
+    real = gb_pipeline._weighted_kmeans_lab
+
+    def counting(*a, **kw):
+        calls["n"] += 1
+        return real(*a, **kw)
+
+    monkeypatch.setattr(gb_pipeline, "_weighted_kmeans_lab", counting)
+    rng = np.random.RandomState(0)
+    arr = rng.randint(0, 255, (96, 96, 3)).astype(np.uint8)
+    arr = np.asarray(gb_pipeline.quantize_working_set(Image.fromarray(arr, "RGB"), 28))
+    gb_pipeline.pack_palettes(arr, 7)
+    # Pre-change this is O(pairs) ~ thousands; the lazy-proxy heap must keep it
+    # within a small multiple of the number of merges (144 tiles -> < 800).
+    assert calls["n"] < 800

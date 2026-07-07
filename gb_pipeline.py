@@ -181,6 +181,21 @@ def _pad4(palette: np.ndarray) -> np.ndarray:
     return np.concatenate([palette, pad], axis=0)
 
 
+def _weighted_draw(rng, p):
+    """Deterministic weighted index draw via cumsum + searchsorted.
+
+    Equivalent in distribution to ``rng.choice(len(p), p=p/p.sum())`` but uses a
+    single uniform draw, avoiding the O(n log n) normalization/alias work inside
+    ``rng.choice``. Fully deterministic under the seeded RNG.
+    """
+    cum = np.cumsum(p)
+    return int(
+        np.searchsorted(cum, rng.random_sample() * cum[-1], side="right").clip(
+            0, len(p) - 1
+        )
+    )
+
+
 def _weighted_kmeans_lab(
     points: np.ndarray, weights: np.ndarray, k: int, seed: int = 42, n_iter: int = 25
 ) -> np.ndarray:
@@ -199,13 +214,13 @@ def _weighted_kmeans_lab(
     rng = _seeded_rng(seed)
     total_w = weights.sum()
     probs = weights / total_w if total_w > 0 else np.full(n, 1.0 / n)
-    first = int(rng.choice(n, p=probs))
+    first = _weighted_draw(rng, probs)
     centers = [points[first]]
     d2 = np.sum((points - points[first]) ** 2, axis=1)
     for _ in range(1, k):
         p = d2 * weights
         s = p.sum()
-        j = int(rng.choice(n, p=p / s)) if s > 0 else int(rng.choice(n))
+        j = _weighted_draw(rng, p) if s > 0 else int(rng.randint(n))
         centers.append(points[j])
         d2 = np.minimum(d2, np.sum((points - points[j]) ** 2, axis=1))
     centers = np.array(centers, dtype=np.float64)
@@ -221,7 +236,7 @@ def _weighted_kmeans_lab(
             if mask.any():
                 w = weights[mask]
                 new_centers[c] = (points[mask] * w[:, None]).sum(0) / w.sum()
-        if np.allclose(new_centers, centers):
+        if float(np.max(np.abs(new_centers - centers))) < 1e-9:
             centers = new_centers
             break
         centers = new_centers
@@ -331,20 +346,26 @@ def pack_palettes(
             tile_colors[t] = idx
             tile_counts[t] = cnt.astype(np.float64)
 
-    def build_palette(idxs, cnts):
-        """(4,3) uint8 palette fitted to working-set colors idxs (+counts).
+    def fit_centers_lab(idxs, cnts):
+        """Lab centers for working-set colors idxs (each own center if <=4)."""
+        idxs = np.asarray(idxs)
+        if len(idxs) <= 4:
+            return ws_lab[idxs]
+        return _weighted_kmeans_lab(ws_lab[idxs], cnts, 4)
 
-        <=4 colors are represented exactly; >4 colors are fit by weighted
-        4-means. Colors are snapped to RGB555, projected onto the custom set
-        if one is given, and luminance-sorted. Used to produce the palettes
-        actually returned -- called O(groups + merges) times, not in the
-        agglomerative inner loop.
+    def palette_from_centers(idxs, centers):
+        """(4,3) uint8 palette from PRECOMPUTED Lab centers for idxs.
+
+        Identical tail to ``build_palette`` but takes centers the caller already
+        fitted, so a group can share one k-means fit between its palette and its
+        error. <=4 colors are represented exactly; else the Lab centers are used.
+        Colors are snapped to RGB555, projected onto the custom set if one is
+        given, and luminance-sorted.
         """
         idxs = np.asarray(idxs)
         if len(idxs) <= 4:
             palette = ws_colors[idxs]
         else:
-            centers = _weighted_kmeans_lab(ws_lab[idxs], cnts, 4)
             palette = _lab_to_rgb_u8(centers)
         palette = snap_rgb555(palette)
         if cust is not None:
@@ -353,12 +374,15 @@ def pack_palettes(
         palette = luminance_sort(snap_rgb555(_pad4(palette)))
         return palette.astype(np.uint8)
 
-    def fit_centers_lab(idxs, cnts):
-        """Lab centers for working-set colors idxs (each own center if <=4)."""
+    def build_palette(idxs, cnts):
+        """(4,3) uint8 palette fitted to working-set colors idxs (+counts).
+
+        <=4 colors are represented exactly; >4 colors are fit by weighted
+        4-means. Used for the per-tile Phase-1 seeding loop and Phase-2 refit
+        where only the palette (not the error) is needed.
+        """
         idxs = np.asarray(idxs)
-        if len(idxs) <= 4:
-            return ws_lab[idxs]
-        return _weighted_kmeans_lab(ws_lab[idxs], cnts, 4)
+        return palette_from_centers(idxs, fit_centers_lab(idxs, cnts))
 
     def lab_error(idxs, cnts, centers_lab):
         """Weighted sum of each color's nearest Euclidean-Lab distance."""
@@ -375,8 +399,11 @@ def pack_palettes(
     key_to_id = {}
     next_id = 0
     for t in range(n_tiles):
-        pal_t = build_palette(tile_colors[t], tile_counts[t])
-        key = frozenset(map(tuple, pal_t.tolist()))
+        # Group tiles by their working-set color-index SET (which fully
+        # determines the fitted 4-means palette) rather than by first fitting a
+        # palette per tile -- that seeding fit was a second k-means per tile on
+        # top of finalize's. finalize now performs the single fit per group.
+        key = frozenset(int(i) for i in tile_colors[t])
         if key in key_to_id:
             g = groups[key_to_id[key]]
             g["members"].append(t)
@@ -395,13 +422,22 @@ def pack_palettes(
         g = groups[gid]
         idxs = np.array(sorted(g["colors"].keys()), dtype=np.int64)
         cnts = np.array([g["colors"][int(i)] for i in idxs], dtype=np.float64)
-        g["palette"] = build_palette(idxs, cnts)
-        g["error"] = lab_error(idxs, cnts, fit_centers_lab(idxs, cnts))
+        centers = fit_centers_lab(idxs, cnts)
+        g["centers"] = centers
+        g["palette"] = palette_from_centers(idxs, centers)
+        g["error"] = lab_error(idxs, cnts, centers)
 
     for gid in list(groups.keys()):
         finalize(gid)
 
     def merge_cost(a, b):
+        """Exact merged-palette error increase from merging groups a and b.
+
+        The combined colors are re-fit to 4 centers by weighted k-means; the
+        cost is that error minus the two groups' self-errors (floored at 0).
+        This is the one exact k-means fit the lazy heap defers until a proxy
+        entry for the pair is actually popped.
+        """
         ga, gb = groups[a], groups[b]
         comb = dict(ga["colors"])
         for i, c in gb["colors"].items():
@@ -412,6 +448,56 @@ def pack_palettes(
         cnts = np.array([comb[int(i)] for i in idxs], dtype=np.float64)
         err = lab_error(idxs, cnts, fit_centers_lab(idxs, cnts))
         return max(err - (ga["error"] + gb["error"]), 0.0)
+
+    def proxy_cost(a, b):
+        """Cheap merge-cost estimate using stored centers -- NO k-means.
+
+        Error of the combined colors against whichever group's already-fitted
+        4 centers fits them better, minus the two self-errors, floored at 0.
+        Reusing an existing 4-center set (rather than re-fitting to 4) closely
+        tracks the true merge cost, so the cheapest proxies are genuinely the
+        cheapest merges -- the exact k-means fit computed lazily on pop lands the
+        pair at (near) the heap top and it merges promptly, keeping exact fits to
+        a small multiple of the number of merges.
+
+        NOTE (deviation from plan Task 6 Step 4): the plan specified the error
+        against the *union* of both groups' 8 centers minus self-errors, but
+        that quantity is provably <= 0 for every pair (each group's colors fit
+        its own centers, a subset of the union, at least as well), so after the
+        floor it is identically 0 and gives no ranking signal -- the first merge
+        then upgrades every seeded pair (~O(g^2) k-means) and the perf target is
+        missed. Using each group's own 4 centers restores an informative,
+        k-means-free ranking.
+        """
+        ga, gb = groups[a], groups[b]
+        comb = dict(ga["colors"])
+        for i, c in gb["colors"].items():
+            comb[i] = comb.get(i, 0.0) + c
+        if len(comb) <= 4:
+            return 0.0
+        idxs = np.array(sorted(comb.keys()), dtype=np.int64)
+        cnts = np.array([comb[int(i)] for i in idxs], dtype=np.float64)
+        err = min(
+            lab_error(idxs, cnts, ga["centers"]),
+            lab_error(idxs, cnts, gb["centers"]),
+        )
+        return max(err - (ga["error"] + gb["error"]), 0.0)
+
+    def push_pair(heap, a, b):
+        """Push a candidate merge as a lazy heap entry (cost, is_proxy, a, b).
+
+        ``is_proxy`` is 0 for exact costs and 1 for proxy estimates, so at equal
+        cost an EXACT entry sorts before a proxy. This matters because many
+        merges tie at cost 0 (combining similar dense tiles barely raises the
+        4-means error); with proxies-first, the first merge would upgrade every
+        zero-cost proxy before any exact could win (a full O(g^2) cascade).
+        Pairs whose combined color set already fits in 4 are exact by
+        construction (cost 0), skipping a wasted proxy->exact re-push cycle.
+        """
+        if len(set(groups[a]["colors"]) | set(groups[b]["colors"])) <= 4:
+            heapq.heappush(heap, (0.0, 0, a, b))
+        else:
+            heapq.heappush(heap, (proxy_cost(a, b), 1, a, b))
 
     def agglomerate(ids, target):
         """Exact cheapest-pair-first agglomeration of ``ids`` down to ``target``.
@@ -429,16 +515,22 @@ def pack_palettes(
         id_list = sorted(alive)
         for i in range(len(id_list)):
             for j in range(i + 1, len(id_list)):
-                a, b = id_list[i], id_list[j]
-                heapq.heappush(heap, (merge_cost(a, b), a, b))
+                push_pair(heap, id_list[i], id_list[j])
 
         while len(alive) > target:
             pair = None
             while heap:
-                c, a, b = heapq.heappop(heap)
-                if a in alive and b in alive:
-                    pair = (a, b)
-                    break
+                c, is_proxy, a, b = heapq.heappop(heap)
+                if a not in alive or b not in alive:
+                    continue
+                if is_proxy:
+                    # Lazily upgrade the proxy estimate to the exact k-means
+                    # merge cost and re-push (is_proxy=0); only exact entries
+                    # may trigger a merge.
+                    heapq.heappush(heap, (merge_cost(a, b), 0, a, b))
+                    continue
+                pair = (a, b)
+                break
             if pair is None:
                 break
             a, b = pair
@@ -455,7 +547,7 @@ def pack_palettes(
             alive.add(gid)
             for other in alive:
                 if other != gid:
-                    heapq.heappush(heap, (merge_cost(gid, other), min(gid, other), max(gid, other)))
+                    push_pair(heap, min(gid, other), max(gid, other))
         return sorted(alive)
 
     def group_repr_lab(gid):
