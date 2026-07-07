@@ -289,3 +289,14 @@ GOLDEN = {
     "mono_tiles": 141,
     "logo_tiles": 360,      # logo: sequential storage, no dedup (th*tw cells)
 }
+
+
+def test_custom_palette_capacity_warning():
+    rng = np.random.RandomState(3)
+    arr = np.repeat(np.repeat(rng.randint(0, 256, (4, 4, 3)).astype(np.uint8), 8, 0), 8, 1)
+    img = Image.fromarray(arr, "RGB")
+    dmg = gb_pipeline.DMG_RAMP
+    res = gb_pipeline.convert_for_hardware(img, "color_only", custom_palette=dmg)
+    assert any("restricts output to 4 colors" in w for w in res.warnings)
+    res_free = gb_pipeline.convert_for_hardware(img, "color_only")
+    assert not any("restricts output" in w for w in res_free.warnings)

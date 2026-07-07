@@ -139,11 +139,17 @@ def test_process_image_hardware_routes_to_convert_for_hardware(monkeypatch):
     palette = Image.open(GB_PALETTE_PATH).convert("RGB")
     _call_process_image(main.MODE_COLOR, image, palette)
 
-    assert len(calls) == 1
+    # Color mode with an active custom palette dual-runs: the restricted left
+    # pane plus the natural (custom_palette=None) right pane.
+    assert len(calls) == 2
     _, kwargs = calls[0]
     assert kwargs["tile_budget"] == 384
     assert kwargs["reserve_ui_palette"] is True
     assert kwargs["dither"] == "none"
+    assert kwargs["custom_palette"] is not None
+    _, natural_kwargs = calls[1]
+    assert natural_kwargs["custom_palette"] is None
+    assert natural_kwargs["tile_budget"] == 384
 
 
 def test_process_image_artistic_does_not_route_to_hardware(monkeypatch):
@@ -249,3 +255,35 @@ def test_no_committed_secrets_or_shell_deletes():
     assert "discord.com/api/webhooks" not in src
     assert "boobiess" not in src
     assert "os.system" not in src
+
+
+def test_color_mode_custom_palette_natural_pane_differs():
+    image = _small_test_image()
+    palette = Image.open(GB_PALETTE_PATH)
+    out_image, _text, reference_image, notice, _html = _call_process_image(
+        main.MODE_COLOR, image, palette, use_custom_palette=True)
+    out_colors = np.unique(np.asarray(out_image.convert("RGB")).reshape(-1, 3), axis=0)
+    ref_colors = np.unique(np.asarray(reference_image.convert("RGB")).reshape(-1, 3), axis=0)
+    assert len(out_colors) <= 4          # left: clamped to the 4-color custom set
+    assert len(ref_colors) > 4           # right: the converter's own choices
+    assert "restricts output" in notice
+
+
+def test_color_mode_without_custom_palette_single_run(monkeypatch):
+    calls = {"n": 0}
+    real = main.gb_pipeline.convert_for_hardware
+    def counting(*a, **kw):
+        calls["n"] += 1
+        return real(*a, **kw)
+    monkeypatch.setattr(main.gb_pipeline, "convert_for_hardware", counting)
+    _call_process_image(main.MODE_COLOR, _small_test_image(),
+                        Image.open(GB_PALETTE_PATH), use_custom_palette=False)
+    assert calls["n"] == 1
+
+
+def test_mode_switch_to_color_unticks_custom_palette():
+    upd = main.on_mode_change_custom_palette(main.MODE_COLOR)
+    assert upd["value"] is False
+    for mode in (main.MODE_ARTISTIC, main.MODE_MONO, main.MODE_LOGO):
+        upd = main.on_mode_change_custom_palette(mode)
+        assert "value" not in upd

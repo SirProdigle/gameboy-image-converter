@@ -1315,6 +1315,17 @@ def convert_for_hardware(
     if reserve_ui_palette and not ps.mono and n_palettes >= 8:
         n_palettes -= 1
 
+    if custom_palette is not None and not ps.mono:
+        k = int(np.unique(
+            snap_rgb555(np.asarray(custom_palette, dtype=np.uint8).reshape(-1, 3)),
+            axis=0).shape[0])
+        if k < 4 * n_palettes:
+            warnings.append(
+                f"Custom palette restricts output to {k} colors (this preset "
+                f"supports up to {4 * n_palettes}). The right pane shows the "
+                "converter's own choices."
+            )
+
     quantized = quantize_working_set(img, 4 * n_palettes, custom_palette)
     arr = np.asarray(quantized, dtype=np.uint8)
 

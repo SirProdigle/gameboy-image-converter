@@ -679,10 +679,25 @@ def process_image(image, mode, width, height, aspect_ratio,
             mono_ramp=mono_ramp_arr,
         )
 
+        if custom_palette_arr is not None:
+            # Right pane: the converter's own color choices, same settings
+            # minus the custom-palette restriction.
+            natural = gb_pipeline.convert_for_hardware(
+                image, preset,
+                tile_budget=budget,
+                reserve_ui_palette=bool(reserve_ui_palette),
+                dither=dither_key,
+                custom_palette=None,
+                mono_ramp=mono_ramp_arr,
+            )
+            reference_out = natural.image
+        else:
+            reference_out = result.reference
+
         notice = _format_hardware_notice(result)
         palette_text = _format_palette_text(result.palette_hex)
         palette_html = _format_palette_html(result.palette_hex)
-        return result.image, palette_text, result.reference, notice, palette_html
+        return result.image, palette_text, reference_out, notice, palette_html
 
 
 def process_image_folder(input_files, mode, width, height, aspect_ratio,
@@ -789,6 +804,15 @@ def on_mode_change_lock_logo_size(mode):
     if mode == MODE_LOGO:
         return False, 160, 144
     return gr.update(), gr.update(), gr.update()
+
+
+def on_mode_change_custom_palette(mode):
+    """Entering GB Studio: Color unticks the custom palette by default: the
+    bundled gb_palette.png is a 4-color DMG ramp, which would clamp a 28-32
+    color preset to 4 colors. One-way -- other modes leave the box alone."""
+    if mode == MODE_COLOR:
+        return gr.update(value=False)
+    return gr.update()
 
 
 def create_gradio_interface():
@@ -906,6 +930,8 @@ def create_gradio_interface():
                                          outputs=mode_change_outputs)
                 mode_radio.change(fn=on_mode_change_lock_logo_size, inputs=[mode_radio],
                                   outputs=[keep_aspect_ratio, new_width, new_height])
+                mode_radio.change(fn=on_mode_change_custom_palette, inputs=[mode_radio],
+                                  outputs=[use_custom_palette])
 
             with gr.Column():
                 with gr.Group():
