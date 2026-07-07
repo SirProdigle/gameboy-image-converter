@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
+import gb_pipeline
 from gb_pipeline import PRESETS, ConversionResult, convert_for_hardware, snap_rgb555
 
 # Generous but real perf bound: plan calls for "within seconds" on a CI box;
@@ -119,3 +120,48 @@ def test_print_summary():
             f"tiles={row['tiles_used']}/{row['tile_budget']}  "
             f"palettes={row['palettes_used']}  merges={row['n_merges']}"
         )
+
+
+def _mean_lab_error(a_img, b_img):
+    a = gb_pipeline._rgb_to_lab(np.asarray(a_img, dtype=np.uint8))
+    b = gb_pipeline._rgb_to_lab(np.asarray(b_img, dtype=np.uint8))
+    return float(np.sqrt(((a - b) ** 2).sum(axis=1)).mean())
+
+
+def test_indexing_from_original_beats_quantized_source():
+    rng = np.random.RandomState(0)
+    yy, xx = np.mgrid[0:64, 0:64]
+    arr = np.stack([xx * 4, yy * 4, ((xx + yy) * 2)], axis=2)
+    arr = np.clip(arr + rng.normal(0, 6, arr.shape), 0, 255).astype(np.uint8)
+    img = Image.fromarray(arr, "RGB")
+
+    quant = gb_pipeline.quantize_working_set(img, 28)
+    qarr = np.asarray(quant, dtype=np.uint8)
+    palettes, assignment = gb_pipeline.pack_palettes(qarr, 7)
+
+    # dither="none" isolates the indexing-source fidelity property: mapping the
+    # original pixels to the palette loses less than mapping the already-
+    # quantized pixels. (Bayer dithering's off-axis speckle -- fixed in Task 5's
+    # projection dither -- would otherwise dominate this per-pixel Lab metric.)
+    gb_orig = gb_pipeline.index_tiles(arr, palettes, assignment, dither="none")
+    gb_quant = gb_pipeline.index_tiles(qarr, palettes, assignment, dither="none")
+    err_orig = _mean_lab_error(np.asarray(gb_pipeline.render(gb_orig)), arr)
+    err_quant = _mean_lab_error(np.asarray(gb_pipeline.render(gb_quant)), arr)
+    assert err_orig < err_quant
+
+
+def test_convert_for_hardware_color_indexes_from_original():
+    # The public entry point must produce the err_orig result, not err_quant.
+    rng = np.random.RandomState(1)
+    yy, xx = np.mgrid[0:64, 0:64]
+    arr = np.clip(np.stack([xx * 4, yy * 4, (xx + yy) * 2], axis=2)
+                  + rng.normal(0, 6, (64, 64, 3)), 0, 255).astype(np.uint8)
+    img = Image.fromarray(arr, "RGB")
+    res = gb_pipeline.convert_for_hardware(img, "color_only", dither="none")
+    quant = gb_pipeline.quantize_working_set(img, 28)
+    qarr = np.asarray(quant, dtype=np.uint8)
+    palettes, assignment = gb_pipeline.pack_palettes(qarr, 7)
+    gb_quant = gb_pipeline.index_tiles(qarr, palettes, assignment, dither="none")
+    err_pipeline = _mean_lab_error(np.asarray(res.image), arr)
+    err_quant = _mean_lab_error(np.asarray(gb_pipeline.render(gb_quant)), arr)
+    assert err_pipeline < err_quant

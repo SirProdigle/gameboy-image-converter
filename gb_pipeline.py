@@ -587,7 +587,10 @@ def index_tiles(
 ) -> GBImage:
     """Render each 8x8 tile against its assigned palette -> index patterns.
 
-    ``image`` is (H, W, 3) uint8 (already working-set/palette-limited);
+    ``image`` is (H, W, 3) uint8 (any RGB content; typically the original
+    post-crop pixels -- palette assignment is computed from the quantized
+    working set, but per-pixel indexing/dithering is most faithful from the
+    source);
     ``palettes`` is (p, 4, 3) uint8 luminance-sorted (index 0 == lightest);
     ``assignment`` is (H//8, W//8) uint8 palette id per cell.
 
@@ -1347,7 +1350,11 @@ def convert_for_hardware(
         quantized = quantize_working_set(img, 4 * n_palettes, custom_palette)
         arr = np.asarray(quantized, dtype=np.uint8)
         palettes, assignment = pack_palettes(arr, n_palettes, custom_palette)
-        gb = index_tiles(arr, palettes, assignment, dither)
+        # Palette packing runs on the quantized working set, but per-pixel
+        # indexing/dithering reads the ORIGINAL pixels so nearest-entry mapping
+        # and Bayer dithering see real gradients instead of the quantizer's
+        # coarse steps.
+        gb = index_tiles(orig_arr, palettes, assignment, dither)
 
     if not is_logo:
         gb = dedup_patterns(gb, ps.allow_flips)

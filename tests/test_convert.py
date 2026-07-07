@@ -284,7 +284,9 @@ GOLDEN = {
     # importer would store, not the pipeline's internal pattern count. For logo,
     # tiles are stored sequentially with no dedup, so tiles_used is the cell
     # count (th*tw).
-    "color_tiles": 356,     # 360 cells (20x18) deduped, under the 384 budget
+    "color_tiles": 360,     # 360 cells (20x18); indexing from original pixels
+                            #   (Task 4) dedups less than the quantized source did
+                            #   -- still under the 384 budget
     "color_palettes": 7,    # reserve_ui_palette caps color at 7
     "mono_tiles": 189,  # continuous-luminance dither yields more distinct tiles
     "logo_tiles": 360,      # logo: sequential storage, no dedup (th*tw cells)
