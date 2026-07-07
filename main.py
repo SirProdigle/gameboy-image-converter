@@ -659,7 +659,12 @@ def process_image(image, mode, width, height, aspect_ratio,
         elif use_custom_palette:
             custom_palette_arr = _custom_palette_array(custom_palette)
 
-        budget = None if is_logo else int(tile_budget)
+        if is_logo:
+            budget = None
+        elif preset_info.mono:
+            budget = preset_info.tile_budget  # DMG mono scenes are always 192 tiles
+        else:
+            budget = int(tile_budget)
         dither_key = HW_DITHER_METHODS.get(hw_dither_method, "none")
 
         result = gb_pipeline.convert_for_hardware(
@@ -762,7 +767,9 @@ def on_mode_or_logo_change(mode, logo_subtype):
     is_mono = mode == MODE_MONO
     is_logo = mode == MODE_LOGO
     reserve_visible = is_color or (is_logo and logo_subtype != "Mono")
-    tiles_visible = is_color or is_mono
+    # The tile-budget picker is a Color-mode scene-type choice (192 vs 384).
+    # Mono is always 192 (DMG), Logo is unlimited -- neither offers a choice.
+    tiles_visible = is_color
     tile_budget_value = 384 if is_color else 192 if is_mono else 384
     return (
         gr.update(visible=is_artistic),                            # artistic_panel
@@ -824,7 +831,11 @@ def create_gradio_interface():
                             label="Reserve palette 8 for dialogue/UI", value=True)
                         hw_dither_method = gr.Dropdown(choices=list(HW_DITHER_METHODS.keys()),
                                                        label="Dither Method", value="None")
-                    tile_budget_number = gr.Number(label="Tile budget", value=384, precision=0)
+                    tile_budget_number = gr.Radio(
+                        choices=[("Mono + Colour (192)", 192), ("GBC only (384)", 384)],
+                        value=384,
+                        label="Tile budget",
+                    )
                     logo_subtype_radio = gr.Radio(choices=["Color", "Mono"], value="Color",
                                                   label="Logo Palette Type", visible=False)
 

@@ -188,6 +188,8 @@ def test_on_mode_or_logo_change_visibility():
         main.MODE_MONO, "Color"
     )
     assert reserve["visible"] is False
+    # Mono is always 192 tiles (DMG) -- no budget choice, so the picker hides.
+    assert tiles["visible"] is False
     assert tiles["value"] == 192
 
     artistic, hardware, reserve, tiles, logo, effects = main.on_mode_or_logo_change(
