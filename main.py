@@ -529,6 +529,15 @@ def _format_hardware_notice(result: "gb_pipeline.ConversionResult") -> str:
     else:
         tiles_part = f"{stats['tiles_used']}/{stats['tile_budget']} tiles"
     notice = f"✅ {tiles_part} · {stats['palettes_used']} palettes · {stats['n_merges']} merges"
+    if "gbstudio_tiles" in stats:
+        gb_line = (
+            f"GB Studio import: {stats['gbstudio_tiles']} tiles · "
+            f"{stats['gbstudio_palettes_extracted']} palettes"
+        )
+        corrupted = stats.get("gbstudio_corrupted_tiles", 0)
+        if corrupted:
+            gb_line += f" · ⚠️ {corrupted} tiles recolored"
+        notice += "\n" + gb_line
     if result.warnings:
         notice += "\n" + "\n".join(result.warnings)
     return notice

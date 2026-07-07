@@ -294,3 +294,22 @@ def test_resize_filter_resolution():
     assert main._resolve_resample("Auto", main.MODE_ARTISTIC) == Image.NEAREST
     assert main._resolve_resample("Nearest (pixel art)", main.MODE_COLOR) == Image.NEAREST
     assert main._resolve_resample("Lanczos (smooth)", main.MODE_ARTISTIC) == Image.LANCZOS
+
+
+def test_hardware_notice_shows_gbstudio_import_counts():
+    """Color notices surface GB Studio's real import figures (tiles/palettes)
+    and flag tiles it would recolor, so the count shown is the honest one."""
+    import types
+    import main
+    result = types.SimpleNamespace(
+        stats={
+            "tiles_used": 360, "tile_budget": 384, "palettes_used": 7,
+            "n_merges": 0, "gbstudio_tiles": 247,
+            "gbstudio_palettes_extracted": 10, "gbstudio_corrupted_tiles": 39,
+        },
+        warnings=[],
+    )
+    notice = main._format_hardware_notice(result)
+    assert "GB Studio" in notice
+    assert "247" in notice and "10" in notice
+    assert "39" in notice  # recolored tiles surfaced

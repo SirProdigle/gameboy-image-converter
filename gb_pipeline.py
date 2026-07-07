@@ -15,6 +15,8 @@ import numpy as np
 from PIL import Image
 from skimage.color import lab2rgb, rgb2lab
 
+import gb_studio_import
+
 # Cache of the post-seed RandomState state for each seed value used by
 # _weighted_kmeans_lab, keyed by seed. Reusing this via a per-thread
 # RandomState (see _seeded_rng) skips numpy's SeedSequence re-derivation on
@@ -1604,6 +1606,19 @@ def convert_for_hardware(
         "preset": ps.name,
         "dither": dither,
     }
+
+    # Honest cross-check against GB Studio's *actual* Color-Only importer: it
+    # re-derives palettes/tiles from the rendered pixels with a different
+    # algorithm than verify_roundtrip, so it can extract >8 palettes (silently
+    # recoloring the overflow) or count more tiles than we think. Report those
+    # real numbers and warn. (Mono uses the DMG path, which round-trips cleanly.)
+    if not ps.mono:
+        gs_stats = gb_studio_import.gbstudio_color_stats(
+            np.asarray(final_img.convert("RGB"), dtype=np.uint8)
+        )
+        gs_warnings, gs_extra = gb_studio_import.gbstudio_report(gs_stats, budget)
+        warnings.extend(gs_warnings)
+        stats.update(gs_extra)
 
     return ConversionResult(
         image=final_img,
