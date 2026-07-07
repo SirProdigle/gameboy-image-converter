@@ -1203,11 +1203,15 @@ def verify_roundtrip(png: Image.Image, preset: Preset, expected: GBImage) -> int
 def _index_tiles_mono(
     image: np.ndarray, palettes: np.ndarray, dither: str = "none"
 ) -> GBImage:
-    """Index every pixel to the mono ramp by luminance rank (Stage 4, mono).
+    """Index pixels to the mono ramp by contrast-stretched luminance (Stage 4, mono).
 
-    ``palettes`` is the (1, 4, 3) luminance-sorted ramp. Each pixel takes the
-    ramp entry nearest in luminance; with ``dither="bayer"`` it picks between
-    the two nearest ramp levels using the absolute-coordinate Bayer threshold.
+    ``image`` is the ORIGINAL (post-crop/resize) RGB array -- mono deliberately
+    skips the working-set quantizer so ordered dithering sees continuous tone.
+    Pixel luminance is percentile-stretched (1st..99th -> 0..1) and quantized to
+    the 4 ramp levels evenly: x = lum_n * 3, base = floor(x), and the pixel
+    takes ``base + 1`` iff the fractional part exceeds the threshold (0.5 when
+    dither="none", else the absolute-coordinate 4x4 Bayer threshold). Ramp
+    index 0 is lightest, so the stored index is ``3 - level``.
     """
     if dither not in ("none", "bayer"):
         raise ValueError(f"unknown dither mode: {dither!r}")
@@ -1215,27 +1219,32 @@ def _index_tiles_mono(
     h, w = arr.shape[:2]
     th, tw = h // 8, w // 8
 
-    ramp = np.asarray(palettes, dtype=np.uint8)[0]  # (4, 3)
-    ramp_lum = _pixel_luminance(ramp)               # (4,)
-    px_lum = _pixel_luminance(arr)                   # (h, w)
+    ramp = np.asarray(palettes, dtype=np.uint8)[0]  # (4, 3), lightest first
 
-    dist = np.abs(px_lum[:, :, None] - ramp_lum[None, None, :])  # (h, w, 4)
-    order = np.argsort(dist, axis=2, kind="stable")
-    idx1 = order[:, :, 0]
-    if dither == "bayer":
-        idx2 = order[:, :, 1]
-        d1 = np.take_along_axis(dist, idx1[:, :, None], axis=2)[:, :, 0]
-        d2 = np.take_along_axis(dist, idx2[:, :, None], axis=2)[:, :, 0]
-        denom = d1 + d2
-        t_val = np.where(denom > 0, d1 / np.where(denom > 0, denom, 1.0), 0.0)
+    lum = _pixel_luminance(arr)  # (h, w) float
+    lo, hi = np.percentile(lum, [1.0, 99.0])
+    degenerate = hi - lo < 1e-9
+    if degenerate:
+        lum_n = np.full_like(lum, 0.5, dtype=np.float64)
+    else:
+        lum_n = np.clip((lum - lo) / (hi - lo), 0.0, 1.0)
+
+    x = lum_n * 3.0
+    base = np.minimum(np.floor(x), 2.0)
+    frac = x - base
+    # A degenerate (single-tone) image must collapse to one ramp level; the
+    # ordered-dither threshold straddles frac=0.5 and would split it, so fall
+    # back to plain rounding when there is no tonal range to dither.
+    if dither == "bayer" and not degenerate:
         yy = np.arange(h)[:, None]
         xx = np.arange(w)[None, :]
         thresh = BAYER4[yy % 4, xx % 4]
-        index = np.where(t_val > thresh, idx2, idx1)
     else:
-        index = idx1
+        thresh = 0.5
+    level = base + (frac > thresh)
+    level = np.clip(level, 0, 3)
+    index = (3 - level).astype(np.uint8)  # ramp is lightest-first
 
-    index = index.astype(np.uint8)
     n_tiles = th * tw
     patterns = np.zeros((n_tiles, 8, 8), dtype=np.uint8)
     for tr in range(th):
@@ -1326,14 +1335,17 @@ def convert_for_hardware(
                 "converter's own choices."
             )
 
-    quantized = quantize_working_set(img, 4 * n_palettes, custom_palette)
-    arr = np.asarray(quantized, dtype=np.uint8)
+    orig_arr = np.asarray(img, dtype=np.uint8)
 
     if ps.mono:
+        # Mono skips the working-set quantizer entirely: the luminance path
+        # dithers continuous tone straight to the 4-level ramp.
         ramp = DMG_RAMP if mono_ramp is None else np.asarray(mono_ramp, dtype=np.uint8)
-        palettes, _ = pack_palettes_mono(arr, ramp)
-        gb = _index_tiles_mono(arr, palettes, dither)
+        palettes, _ = pack_palettes_mono(orig_arr, ramp)
+        gb = _index_tiles_mono(orig_arr, palettes, dither)
     else:
+        quantized = quantize_working_set(img, 4 * n_palettes, custom_palette)
+        arr = np.asarray(quantized, dtype=np.uint8)
         palettes, assignment = pack_palettes(arr, n_palettes, custom_palette)
         gb = index_tiles(arr, palettes, assignment, dither)
 

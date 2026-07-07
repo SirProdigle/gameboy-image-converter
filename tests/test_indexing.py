@@ -2,6 +2,7 @@
 
 import numpy as np
 
+import gb_pipeline
 from gb_pipeline import BAYER4, index_tiles, snap_rgb555
 
 
@@ -123,3 +124,44 @@ def test_bayer_matrix_shape_and_values():
     assert BAYER4.shape == (4, 4)
     assert np.isclose(BAYER4.max(), 15 / 16.0)
     assert np.isclose(BAYER4.min(), 0.0)
+
+
+# --- mono luminance path (Task 3) -----------------------------------------
+
+
+def test_mono_bayer_dithers_continuous_gradient():
+    w, h = 160, 8
+    grad = np.tile(np.linspace(0, 255, w, dtype=np.uint8), (h, 1))
+    arr = np.stack([grad] * 3, axis=2)
+    ramp = gb_pipeline.DMG_RAMP
+    palettes = np.asarray(gb_pipeline.luminance_sort(gb_pipeline.snap_rgb555(ramp)))[None]
+    gb = gb_pipeline._index_tiles_mono(arr, palettes, dither="bayer")
+    idx = np.concatenate([gb.patterns[t] for t in range(gb.patterns.shape[0])], axis=1)
+    # Monotonic mean index (lightest-first ramp: index 0 is lightest, gradient
+    # goes dark->light left->right, so mean index must be non-increasing along x,
+    # allowing dither noise).
+    col_means = idx.mean(axis=0)
+    smooth = np.convolve(col_means, np.ones(8) / 8, mode="valid")
+    assert np.all(np.diff(smooth) <= 0.15)
+    # Transition zones actually mix two adjacent levels.
+    mid = idx[:, w // 3 : 2 * w // 3]
+    assert len(np.unique(mid)) >= 2
+
+
+def test_mono_no_dither_gives_clean_bands():
+    w, h = 160, 8
+    grad = np.tile(np.linspace(0, 255, w, dtype=np.uint8), (h, 1))
+    arr = np.stack([grad] * 3, axis=2)
+    palettes = np.asarray(gb_pipeline.DMG_RAMP)[None]
+    gb = gb_pipeline._index_tiles_mono(arr, palettes, dither="none")
+    idx = np.concatenate([gb.patterns[t] for t in range(gb.patterns.shape[0])], axis=1)
+    # Every column is a single level; 4 bands total.
+    assert all(len(np.unique(idx[:, c])) == 1 for c in range(w))
+    assert len(np.unique(idx)) == 4
+
+
+def test_mono_constant_image_no_crash():
+    arr = np.full((16, 16, 3), 137, dtype=np.uint8)
+    palettes = np.asarray(gb_pipeline.DMG_RAMP)[None]
+    gb = gb_pipeline._index_tiles_mono(arr, palettes, dither="bayer")
+    assert len(np.unique(gb.patterns)) == 1
