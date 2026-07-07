@@ -1069,11 +1069,27 @@ def merge_to_budget(gb: GBImage, budget: int, allow_flips: bool) -> tuple:
     work_vflip = gb.attrs_vflip.copy()
     alive = np.ones(n, dtype=bool)
 
-    # Optional full distance/orientation matrices (small-n fast path). They are
-    # None on the clustering path so the signature-refresh matrix update is
-    # guarded by ``if best is not None``.
-    best = None
-    orient_idx = None
+    def _direct_dist_orient(a, b):
+        """Distance/orientation for one pair straight from current signatures."""
+        best_d = np.inf
+        best_v = ""
+        sa = sig_flat[a]
+        for v in variant_names:
+            diff = sa - var_flat[v][b]
+            d = float(np.mean(diff * diff))
+            if d < best_d:
+                best_d = d
+                best_v = v
+        return best_d, best_v
+
+    # Optional full distance/orientation matrices (small-n fast path). The
+    # matrix caches distances between the INITIAL signatures; once a pattern
+    # has absorbed another (version > 0) its signature has been refreshed, so
+    # pairs touching it are computed directly instead. Heap entries snapshot
+    # both endpoints' versions, so a stale-signature entry is lazily re-pushed
+    # with a freshly computed cost on pop -- no eager matrix maintenance per
+    # merge (recomputing b's row/column and re-seeding O(n) pairs per merge
+    # dominated the whole pipeline's runtime on heavy-merge content).
     if n <= _MERGE_MATRIX_MAX:
         best = np.full((n, n), np.inf, dtype=np.float64)
         orient_idx = np.zeros((n, n), dtype=np.int8)
@@ -1090,20 +1106,12 @@ def merge_to_budget(gb: GBImage, budget: int, allow_flips: bool) -> tuple:
         np.fill_diagonal(best, np.inf)
 
         def dist_orient(a, b):
+            if version[a] or version[b]:
+                return _direct_dist_orient(a, b)
             return float(best[a, b]), variant_names[int(orient_idx[a, b])]
 
     else:
-        def dist_orient(a, b):
-            best_d = np.inf
-            best_v = ""
-            sa = sig_flat[a]
-            for v in variant_names:
-                diff = sa - var_flat[v][b]
-                d = float(np.mean(diff * diff))
-                if d < best_d:
-                    best_d = d
-                    best_v = v
-            return best_d, best_v
+        dist_orient = _direct_dist_orient
 
     heap: list = []
     counter = 0
@@ -1169,27 +1177,6 @@ def merge_to_budget(gb: GBImage, budget: int, allow_flips: bool) -> tuple:
             for vn in variant_names:
                 var_flat[vn][b] = _flip_signature(new_sig, vn).reshape(192)
             version[b] += 1
-
-            if best is not None:
-                # Matrix fast path: recompute b's row (b as source) and column
-                # (b as target) distances/orientations against every pattern.
-                dsrc = np.stack([
-                    np.mean((sig_flat[b][None, :] - var_flat[vn]) ** 2, axis=1)
-                    for vn in variant_names
-                ])  # (V, n): b as source A, others as target B
-                dtgt = np.stack([
-                    np.mean((sig_flat - var_flat[vn][b][None, :]) ** 2, axis=1)
-                    for vn in variant_names
-                ])  # (V, n): others as source A, b as target B
-                best[b, :] = dsrc.min(axis=0)
-                orient_idx[b, :] = dsrc.argmin(axis=0)
-                best[:, b] = dtgt.min(axis=0)
-                orient_idx[:, b] = dtgt.argmin(axis=0)
-                best[b, b] = np.inf
-                # Push refreshed candidate pairs for b against all alive patterns.
-                for other in np.nonzero(alive)[0]:
-                    if int(other) != b:
-                        push_pair(int(other), b)
 
             usage[b] += usage[a]
             usage[a] = 0
