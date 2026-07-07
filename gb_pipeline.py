@@ -931,6 +931,14 @@ def _flip_signature(sig: np.ndarray, variant: str) -> np.ndarray:
     return out
 
 
+def _refresh_signature(sig_b, sig_a, u_b, u_a, orientation):
+    """Usage-weighted blend of a merged-away pattern's signature into its
+    survivor, after aligning a into b's frame (flips are involutions, so the
+    same variant name maps b->a and a->b)."""
+    aligned = _flip_signature(sig_a, orientation)
+    return (float(u_b) * sig_b + float(u_a) * aligned) / float(u_b + u_a)
+
+
 def _pattern_signatures(gb: GBImage) -> np.ndarray:
     """Render every pattern under its usage-weighted average palette -> Lab.
 
@@ -1050,13 +1058,22 @@ def merge_to_budget(gb: GBImage, budget: int, allow_flips: bool) -> tuple:
         gb.tilemap.reshape(-1).astype(np.int64), minlength=n
     ).astype(np.int64)
 
+    # Per-pattern signature version: bumped whenever a pattern absorbs another
+    # (its signature is refreshed). Heap entries snapshot both endpoints'
+    # versions so stale-signature costs are lazily recomputed on pop.
+    version = np.zeros(n, dtype=np.int64)
+
     # Working copies mutated in place as cells are retargeted.
     work_tilemap = gb.tilemap.copy().astype(np.int64)
     work_hflip = gb.attrs_hflip.copy()
     work_vflip = gb.attrs_vflip.copy()
     alive = np.ones(n, dtype=bool)
 
-    # Optional full distance/orientation matrices (small-n fast path).
+    # Optional full distance/orientation matrices (small-n fast path). They are
+    # None on the clustering path so the signature-refresh matrix update is
+    # guarded by ``if best is not None``.
+    best = None
+    orient_idx = None
     if n <= _MERGE_MATRIX_MAX:
         best = np.full((n, n), np.inf, dtype=np.float64)
         orient_idx = np.zeros((n, n), dtype=np.int8)
@@ -1096,7 +1113,11 @@ def merge_to_budget(gb: GBImage, budget: int, allow_flips: bool) -> tuple:
         a, b = (i, j) if usage[i] <= usage[j] else (j, i)  # a == replaced
         d, _ = dist_orient(a, b)
         cost = d * float(usage[a])
-        heapq.heappush(heap, (cost, counter, int(a), int(b), int(usage[a])))
+        heapq.heappush(
+            heap,
+            (cost, counter, int(a), int(b), int(usage[a]),
+             int(version[a]), int(version[b])),
+        )
         counter += 1
 
     def seed_pairs(indices):
@@ -1112,11 +1133,12 @@ def merge_to_budget(gb: GBImage, budget: int, allow_flips: bool) -> tuple:
     def run_heap():
         nonlocal n_merges, alive_count
         while alive_count > budget and heap:
-            cost, _, a, b, snap = heapq.heappop(heap)
+            cost, _, a, b, snap, ver_a, ver_b = heapq.heappop(heap)
             if not alive[a] or not alive[b]:
                 continue
-            if int(usage[a]) != snap:
-                # Replaced pattern absorbed others since push -> stale cost.
+            if int(usage[a]) != snap or version[a] != ver_a or version[b] != ver_b:
+                # Replaced pattern absorbed others (stale usage) or either
+                # endpoint's signature was refreshed since push -> stale cost.
                 push_pair(a, b)
                 continue
             # Valid cheapest merge a -> b.
@@ -1136,6 +1158,38 @@ def merge_to_budget(gb: GBImage, budget: int, allow_flips: bool) -> tuple:
             diff = sa - sb_v
             per_pixel = np.sqrt(np.sum(diff * diff, axis=2)).reshape(-1)  # (64,)
             merge_records.append((per_pixel, cnt))
+
+            # Stage-6 signature refresh: usage-weighted blend of a's (orientation-
+            # aligned) signature into survivor b so later merge costs measure b's
+            # *current* content. Uses pre-merge usages.
+            new_sig = _refresh_signature(
+                sig_lab[b], sig_lab[a], usage[b], usage[a], v)
+            sig_lab[b] = new_sig
+            sig_flat[b] = new_sig.reshape(192)
+            for vn in variant_names:
+                var_flat[vn][b] = _flip_signature(new_sig, vn).reshape(192)
+            version[b] += 1
+
+            if best is not None:
+                # Matrix fast path: recompute b's row (b as source) and column
+                # (b as target) distances/orientations against every pattern.
+                dsrc = np.stack([
+                    np.mean((sig_flat[b][None, :] - var_flat[vn]) ** 2, axis=1)
+                    for vn in variant_names
+                ])  # (V, n): b as source A, others as target B
+                dtgt = np.stack([
+                    np.mean((sig_flat - var_flat[vn][b][None, :]) ** 2, axis=1)
+                    for vn in variant_names
+                ])  # (V, n): others as source A, b as target B
+                best[b, :] = dsrc.min(axis=0)
+                orient_idx[b, :] = dsrc.argmin(axis=0)
+                best[:, b] = dtgt.min(axis=0)
+                orient_idx[:, b] = dtgt.argmin(axis=0)
+                best[b, b] = np.inf
+                # Push refreshed candidate pairs for b against all alive patterns.
+                for other in np.nonzero(alive)[0]:
+                    if int(other) != b:
+                        push_pair(int(other), b)
 
             usage[b] += usage[a]
             usage[a] = 0

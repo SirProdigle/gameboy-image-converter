@@ -244,3 +244,47 @@ def test_clustering_fast_path_lands_on_budget(monkeypatch):
     assert n2 == n_merges
     assert np.array_equal(result.tilemap, result2.tilemap)
     assert np.array_equal(result.patterns, result2.patterns)
+
+
+def _flat_pattern(v):
+    return np.full((8, 8), v, dtype=np.uint8)
+
+
+def test_signature_refresh_prevents_drift():
+    # Grayscale palette; three flat patterns at indices 0, 1, 3 (light, mid, dark).
+    # usages: light=1, mid=1, dark=100. Budget forces two merges.
+    # Merge 1: light->mid (cheapest). With STATIC signatures, merge 2 compares
+    # dark against mid's ORIGINAL signature. With refresh, mid's signature has
+    # drifted toward light, making the (mid+light)->dark merge measurably
+    # different. Assert the refreshed p95 reflects the blended distance:
+    # the final single pattern must be the high-usage dark one, and mid's
+    # cells' recorded per-pixel distance must be measured against dark, not
+    # against mid's stale pre-merge self.
+    pal = gb_pipeline.snap_rgb555(np.array(
+        [[[220, 220, 220], [150, 150, 150], [90, 90, 90], [30, 30, 30]]],
+        dtype=np.uint8))
+    th, tw = 1, 102
+    tilemap = np.zeros((th, tw), dtype=np.int32)
+    tilemap[0, 0] = 0
+    tilemap[0, 1] = 1
+    tilemap[0, 2:] = 2
+    patterns = np.stack([_flat_pattern(0), _flat_pattern(1), _flat_pattern(3)])
+    gb = gb_pipeline.GBImage(
+        patterns=patterns, tilemap=tilemap,
+        attrs_palette=np.zeros((th, tw), dtype=np.uint8),
+        attrs_hflip=np.zeros((th, tw), dtype=bool),
+        attrs_vflip=np.zeros((th, tw), dtype=bool),
+        palettes=pal)
+    merged, n = gb_pipeline.merge_to_budget(gb, budget=1, allow_flips=False)
+    assert n == 2
+    assert merged.patterns.shape[0] == 1
+    # Survivor must be the dark pattern (usage 100 dominates both merges).
+    assert np.array_equal(merged.patterns[0], _flat_pattern(3))
+
+
+def test_refresh_signature_blend():
+    sig = np.zeros((2, 8, 8, 3))
+    sig[0, :, :, 0] = 10.0   # pattern a
+    sig[1, :, :, 0] = 30.0   # pattern b
+    out = gb_pipeline._refresh_signature(sig[1], sig[0], u_b=3, u_a=1, orientation="")
+    assert np.allclose(out[:, :, 0], 25.0)  # (3*30 + 1*10) / 4
