@@ -243,6 +243,13 @@ def _weighted_kmeans_lab(
     return centers
 
 
+# Working-set head-room: the global quantizer keeps FACTOR x the final color
+# budget so per-palette 4-means can place centers regionally instead of being
+# limited to the global quantizer's exact final picks. Cost: more Phase-1
+# groups (bounded by the GROUP_EXACT_TRIGGER pre-cluster fast path).
+WORKING_SET_FACTOR = 4
+
+
 def quantize_working_set(
     image: Image.Image, max_colors: int, custom_palette: np.ndarray | None = None
 ) -> Image.Image:
@@ -575,8 +582,12 @@ def pack_palettes(
     # photographic images (e.g. full 320x288 canvases) take the fast path.
     GROUP_EXACT_TRIGGER = 200
     # Target cluster size once triggered -- small enough that the O(size^2)
-    # exact pass per cluster stays fast even with many clusters.
-    GROUP_CLUSTER_TARGET = 50
+    # exact pass per cluster stays fast even with many clusters. Task 8's
+    # wider working set (WORKING_SET_FACTOR) roughly quadruples Phase-1 group
+    # counts on photo content, so this was tightened from 50 (paired with the
+    # sub_budget slack reduction below) to keep the 320x288 color_only bench
+    # within 2x of the pre-Task-8 number.
+    GROUP_CLUSTER_TARGET = 30
     all_ids = sorted(groups.keys())
     if len(all_ids) > max(n_palettes, GROUP_EXACT_TRIGGER):
         reps = []
@@ -599,9 +610,13 @@ def pack_palettes(
             if not members:
                 continue
             # Proportional sub-budget with slack so the final exact pass
-            # still has real cross-cluster merge choices to make.
+            # still has real cross-cluster merge choices to make. Slack
+            # trimmed from 4 to 2 alongside GROUP_CLUSTER_TARGET (see above)
+            # -- the final cross-cluster agglomerate's cost scales with
+            # survivor count, and Task 8's larger per-group color sets make
+            # that pass noticeably more expensive per pair.
             share = max(1, int(np.ceil(n_palettes * len(members) / len(all_ids))))
-            sub_budget = min(len(members), share + 4)
+            sub_budget = min(len(members), share + 2)
             survivors.extend(agglomerate(members, sub_budget))
         all_ids = survivors
 
@@ -1494,7 +1509,9 @@ def convert_for_hardware(
         palettes, _ = pack_palettes_mono(orig_arr, ramp)
         gb = _index_tiles_mono(orig_arr, palettes, dither)
     else:
-        quantized = quantize_working_set(img, 4 * n_palettes, custom_palette)
+        quantized = quantize_working_set(
+            img, min(4 * n_palettes * WORKING_SET_FACTOR, 128), custom_palette
+        )
         arr = np.asarray(quantized, dtype=np.uint8)
         palettes, assignment = pack_palettes(arr, n_palettes, custom_palette)
         # Palette packing runs on the quantized working set, but per-pixel

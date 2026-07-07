@@ -165,3 +165,20 @@ def test_convert_for_hardware_color_indexes_from_original():
     err_pipeline = _mean_lab_error(np.asarray(res.image), arr)
     err_quant = _mean_lab_error(np.asarray(gb_pipeline.render(gb_quant)), arr)
     assert err_pipeline < err_quant
+
+
+def test_wider_working_set_does_not_hurt_fidelity():
+    rng = np.random.RandomState(2)
+    yy, xx = np.mgrid[0:64, 0:64]
+    arr = np.clip(np.stack([xx * 4, yy * 4, (xx + yy) * 2], axis=2)
+                  + rng.normal(0, 6, (64, 64, 3)), 0, 255).astype(np.uint8)
+    img = Image.fromarray(arr, "RGB")
+
+    def run(max_colors):
+        quant = gb_pipeline.quantize_working_set(img, max_colors)
+        qarr = np.asarray(quant, dtype=np.uint8)
+        palettes, assignment = gb_pipeline.pack_palettes(qarr, 7)
+        gb = gb_pipeline.index_tiles(arr, palettes, assignment, dither="none")
+        return _mean_lab_error(np.asarray(gb_pipeline.render(gb)), arr)
+
+    assert run(min(28 * gb_pipeline.WORKING_SET_FACTOR, 128)) <= run(28) * 1.02
