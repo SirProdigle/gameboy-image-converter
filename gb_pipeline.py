@@ -699,6 +699,11 @@ def index_tiles(
     No error diffusion -- dithering can never pick a color outside the
     tile's assigned 4-color palette, and is position-stable (dedup-friendly).
 
+    Fully vectorized: Lab conversion runs once over the image's unique colors
+    (chunked at 8192 uniques to bound memory) and once over the palettes,
+    building (n_unique, p) nearest/second-nearest/projection tables that are
+    then gathered per pixel -- no Python per-tile loop.
+
     Returns a GBImage with one pattern per tile cell (raster order), an
     identity tilemap, no flips set, and ``palettes`` passed through unchanged.
     Dedup (fewer patterns) is a later stage.
@@ -713,45 +718,58 @@ def index_tiles(
 
     palettes = np.asarray(palettes, dtype=np.uint8)
     assignment = np.asarray(assignment)
-    pal_lab = np.stack([_rgb_to_lab(pp) for pp in palettes])  # (p, 4, 3)
+    p = palettes.shape[0]
 
-    patterns = np.zeros((n_tiles, 8, 8), dtype=np.uint8)
     tilemap = np.arange(n_tiles, dtype=np.int32).reshape(th, tw)
     attrs_hflip = np.zeros((th, tw), dtype=bool)
     attrs_vflip = np.zeros((th, tw), dtype=bool)
 
-    row_off = np.arange(8)[:, None]
-    col_off = np.arange(8)[None, :]
+    # Lab conversion happens once for the unique colors and once for the
+    # palettes; per-pixel work is a set of vectorized table gathers.
+    uq, inv = np.unique(arr.reshape(-1, 3), axis=0, return_inverse=True)
+    pal_lab = np.stack([_rgb_to_lab(pp) for pp in palettes])  # (p, 4, 3)
+    pcol = np.arange(p)[None, :]
 
-    for tr in range(th):
-        for tc in range(tw):
-            t = tr * tw + tc
-            block = arr[tr * 8 : tr * 8 + 8, tc * 8 : tc * 8 + 8]  # (8,8,3)
-            pid = int(assignment[tr, tc])
-            plab = pal_lab[pid]  # (4,3)
-            blab = _rgb_to_lab(block).reshape(8, 8, 3)
-            diff = blab[:, :, None, :] - plab[None, None, :, :]  # (8,8,4,3)
-            dist = np.sqrt(np.sum(diff * diff, axis=3))  # (8,8,4)
-            order = np.argsort(dist, axis=2, kind="stable")  # nearest-first
-            idx1 = order[:, :, 0]
+    n_uq = uq.shape[0]
+    idx1_t = np.empty((n_uq, p), dtype=np.int8)
+    idx2_t = np.empty((n_uq, p), dtype=np.int8)
+    tval_t = np.zeros((n_uq, p), dtype=np.float64)
+    for lo in range(0, n_uq, 8192):
+        hi_ = min(lo + 8192, n_uq)
+        ulab = _rgb_to_lab(uq[lo:hi_])  # (m, 3)
+        diff = ulab[:, None, None, :] - pal_lab[None, :, :, :]  # (m, p, 4, 3)
+        dist = np.sqrt(np.sum(diff * diff, axis=3))  # (m, p, 4)
+        order = np.argsort(dist, axis=2, kind="stable")  # nearest-first
+        i1 = order[:, :, 0]
+        i2 = order[:, :, 1]
+        c1 = pal_lab[pcol, i1]  # (m, p, 3)
+        c2 = pal_lab[pcol, i2]  # (m, p, 3)
+        seg = c2 - c1
+        seg_len2 = np.sum(seg * seg, axis=2)  # (m, p)
+        proj = np.sum((ulab[:, None, :] - c1) * seg, axis=2)
+        t = np.where(seg_len2 > 0, proj / np.where(seg_len2 > 0, seg_len2, 1.0), 0.0)
+        idx1_t[lo:hi_] = i1
+        idx2_t[lo:hi_] = i2
+        tval_t[lo:hi_] = np.clip(t, 0.0, 1.0)
 
-            if dither == "bayer":
-                idx2 = order[:, :, 1]
-                c1 = plab[idx1]  # (8,8,3)
-                c2 = plab[idx2]  # (8,8,3)
-                seg = c2 - c1  # (8,8,3)
-                seg_len2 = np.sum(seg * seg, axis=2)  # (8,8)
-                proj = np.sum((blab - c1) * seg, axis=2)
-                t_val = np.where(seg_len2 > 0, proj / np.where(seg_len2 > 0, seg_len2, 1.0), 0.0)
-                t_val = np.clip(t_val, 0.0, 1.0)
-                yy = tr * 8 + row_off
-                xx = tc * 8 + col_off
-                thresh = BAYER4[yy % 4, xx % 4]
-                index = np.where(t_val > thresh, idx2, idx1)
-            else:
-                index = idx1
-
-            patterns[t] = index.astype(np.uint8)
+    inv2d = np.asarray(inv).reshape(h, w)
+    pid_px = np.repeat(np.repeat(assignment.astype(np.int64), 8, axis=0), 8, axis=1)
+    i1_px = idx1_t[inv2d, pid_px]
+    if dither == "bayer":
+        i2_px = idx2_t[inv2d, pid_px]
+        t_px = tval_t[inv2d, pid_px]
+        yy = np.arange(h)[:, None]
+        xx = np.arange(w)[None, :]
+        thresh = BAYER4[yy % 4, xx % 4]
+        index = np.where(t_px > thresh, i2_px, i1_px)
+    else:
+        index = i1_px
+    patterns = (
+        index.astype(np.uint8)
+        .reshape(th, 8, tw, 8)
+        .transpose(0, 2, 1, 3)
+        .reshape(n_tiles, 8, 8)
+    )
 
     return GBImage(
         patterns=patterns,

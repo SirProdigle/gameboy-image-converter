@@ -1,9 +1,11 @@
 """Tests for gb_pipeline.py Task 1.3 indexing + Bayer dither (spec Stage 4)."""
 
 import numpy as np
+import pytest
 
 import gb_pipeline
 from gb_pipeline import BAYER4, index_tiles, snap_rgb555
+from gb_pipeline import GBImage, _rgb_to_lab
 
 
 # A simple 4-color palette, distinct colors, luminance-descending order
@@ -202,3 +204,85 @@ def test_mono_constant_image_no_crash():
     palettes = np.asarray(gb_pipeline.DMG_RAMP)[None]
     gb = gb_pipeline._index_tiles_mono(arr, palettes, dither="bayer")
     assert len(np.unique(gb.patterns)) == 1
+
+
+def _index_tiles_reference(image, palettes, assignment, dither="none"):
+    """Frozen copy of the post-Task-5 per-tile index_tiles body.
+
+    Task 7 vectorizes index_tiles; this plain reference (projection-dither
+    spec) pins bit-identical behavior through the rewrite.
+    """
+    if dither not in ("none", "bayer"):
+        raise ValueError(f"unknown dither mode: {dither!r}")
+
+    arr = np.asarray(image, dtype=np.uint8)
+    h, w = arr.shape[:2]
+    th, tw = h // 8, w // 8
+    n_tiles = th * tw
+
+    palettes = np.asarray(palettes, dtype=np.uint8)
+    assignment = np.asarray(assignment)
+    pal_lab = np.stack([_rgb_to_lab(pp) for pp in palettes])  # (p, 4, 3)
+
+    patterns = np.zeros((n_tiles, 8, 8), dtype=np.uint8)
+    tilemap = np.arange(n_tiles, dtype=np.int32).reshape(th, tw)
+    attrs_hflip = np.zeros((th, tw), dtype=bool)
+    attrs_vflip = np.zeros((th, tw), dtype=bool)
+
+    row_off = np.arange(8)[:, None]
+    col_off = np.arange(8)[None, :]
+
+    for tr in range(th):
+        for tc in range(tw):
+            t = tr * tw + tc
+            block = arr[tr * 8 : tr * 8 + 8, tc * 8 : tc * 8 + 8]
+            pid = int(assignment[tr, tc])
+            plab = pal_lab[pid]
+            blab = _rgb_to_lab(block).reshape(8, 8, 3)
+            diff = blab[:, :, None, :] - plab[None, None, :, :]
+            dist = np.sqrt(np.sum(diff * diff, axis=3))
+            order = np.argsort(dist, axis=2, kind="stable")
+            idx1 = order[:, :, 0]
+
+            if dither == "bayer":
+                idx2 = order[:, :, 1]
+                c1 = plab[idx1]
+                c2 = plab[idx2]
+                seg = c2 - c1
+                seg_len2 = np.sum(seg * seg, axis=2)
+                proj = np.sum((blab - c1) * seg, axis=2)
+                t_val = np.where(
+                    seg_len2 > 0, proj / np.where(seg_len2 > 0, seg_len2, 1.0), 0.0
+                )
+                t_val = np.clip(t_val, 0.0, 1.0)
+                yy = tr * 8 + row_off
+                xx = tc * 8 + col_off
+                thresh = BAYER4[yy % 4, xx % 4]
+                index = np.where(t_val > thresh, idx2, idx1)
+            else:
+                index = idx1
+
+            patterns[t] = index.astype(np.uint8)
+
+    return GBImage(
+        patterns=patterns,
+        tilemap=tilemap,
+        attrs_palette=assignment.astype(np.uint8),
+        attrs_hflip=attrs_hflip,
+        attrs_vflip=attrs_vflip,
+        palettes=palettes,
+    )
+
+
+@pytest.mark.parametrize("dither", ["none", "bayer"])
+def test_index_tiles_matches_reference(dither):
+    rng = np.random.RandomState(7)
+    for _ in range(3):
+        h, w = 24, 32
+        arr = rng.randint(0, 256, (h, w, 3)).astype(np.uint8)
+        pals = gb_pipeline.snap_rgb555(rng.randint(0, 256, (3, 4, 3)).astype(np.uint8))
+        pals = np.stack([gb_pipeline.luminance_sort(p) for p in pals])
+        assignment = rng.randint(0, 3, (h // 8, w // 8)).astype(np.uint8)
+        got = gb_pipeline.index_tiles(arr, pals, assignment, dither=dither)
+        want = _index_tiles_reference(arr, pals, assignment, dither=dither)
+        assert np.array_equal(got.patterns, want.patterns)
