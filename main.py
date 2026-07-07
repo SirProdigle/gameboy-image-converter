@@ -402,7 +402,8 @@ def calculate_ssim(tile1, tile2):
     return score
 
 
-def downscale_image(image: Image, new_width: int, new_height: int, keep_aspect_ratio: bool) -> Image:
+def downscale_image(image: Image, new_width: int, new_height: int, keep_aspect_ratio: bool,
+                    resample=Image.NEAREST) -> Image:
     if keep_aspect_ratio:
         old_width, old_height = image.size
         aspect_ratio = old_width / old_height
@@ -410,7 +411,7 @@ def downscale_image(image: Image, new_width: int, new_height: int, keep_aspect_r
             new_width = int(new_height * aspect_ratio)
         else:
             new_height = int(new_width / aspect_ratio)
-    return image.resize((new_width, new_height), Image.NEAREST)
+    return image.resize((new_width, new_height), resample)
 
 
 def limit_colors(image, limit=16, quantize=None, dither=None, palette_image=None):
@@ -465,6 +466,18 @@ MODE_LOGO = "GB Studio: Logo"
 HARDWARE_MODES = (MODE_COLOR, MODE_MONO, MODE_LOGO)
 
 HW_DITHER_METHODS = {"None": "none", "Bayer": "bayer"}
+
+RESIZE_FILTERS = {"Nearest (pixel art)": Image.NEAREST, "Lanczos (smooth)": Image.LANCZOS}
+
+
+def _resolve_resample(resize_filter: str, mode: str):
+    """Resolve the UI's Resize Filter choice to a PIL resample constant.
+    "Auto" picks Lanczos for GB Studio hardware modes (smoother downscales
+    for photographic/painted source art) and Nearest for Artistic (keeps
+    today's pixel-art-preserving default)."""
+    if resize_filter in RESIZE_FILTERS:
+        return RESIZE_FILTERS[resize_filter]
+    return Image.LANCZOS if mode in HARDWARE_MODES else Image.NEAREST
 
 
 def _hardware_preset_for_mode(mode: str, logo_subtype: str) -> str:
@@ -631,7 +644,8 @@ def process_image(image, mode, width, height, aspect_ratio,
                   grayscale, black_and_white, bw_threshold,
                   enable_gothic_filter, brightness_threshold, dot_size, spacing, contrast_boost,
                   noise_factor, edge_enhance, apply_blur, irregular_shape, irregular_size,
-                  reserve_ui_palette, hw_dither_method, tile_budget, logo_subtype):
+                  reserve_ui_palette, hw_dither_method, tile_budget, logo_subtype,
+                  resize_filter="Auto"):
     """Route a single image through the Artistic flow or a GB Studio hardware
     preset, depending on `mode`. Hardware modes call
     `gb_pipeline.convert_for_hardware`; the Artistic path is untouched.
@@ -641,7 +655,8 @@ def process_image(image, mode, width, height, aspect_ratio,
             raise gr.Error("Please provide an input image.")
         if image.mode != "RGB":
             image = image.convert("RGB")
-        image = downscale_image(image, int(width), int(height), aspect_ratio)
+        image = downscale_image(image, int(width), int(height), aspect_ratio,
+                                _resolve_resample(resize_filter, mode))
 
         if mode not in HARDWARE_MODES:
             return _process_artistic(
@@ -706,7 +721,8 @@ def process_image_folder(input_files, mode, width, height, aspect_ratio,
                          grayscale, black_and_white, bw_threshold,
                          enable_gothic_filter, brightness_threshold, dot_size, spacing, contrast_boost,
                          noise_factor, edge_enhance, apply_blur, irregular_shape, irregular_size,
-                         reserve_ui_palette, hw_dither_method, tile_budget, logo_subtype):
+                         reserve_ui_palette, hw_dither_method, tile_budget, logo_subtype,
+                         resize_filter="Auto"):
     with task_log("process_image_folder"):
         folder_name = "output_" + str(random.randint(0, 100000))
         while os.path.exists(folder_name):
@@ -726,6 +742,7 @@ def process_image_folder(input_files, mode, width, height, aspect_ratio,
                     enable_gothic_filter, brightness_threshold, dot_size, spacing, contrast_boost,
                     noise_factor, edge_enhance, apply_blur, irregular_shape, irregular_size,
                     reserve_ui_palette, hw_dither_method, tile_budget, logo_subtype,
+                    resize_filter,
                 )
                 base_name = os.path.basename(input_files[index].name)
                 result[0].save(os.path.join(folder_name, base_name))
@@ -837,6 +854,11 @@ def create_gradio_interface():
                     new_width = gr.Number(label="Width", value=160)
                     new_height = gr.Number(label="Height", value=144)
                     keep_aspect_ratio = gr.Checkbox(label="Keep Aspect Ratio", value=False)
+                    resize_filter_dropdown = gr.Dropdown(
+                        choices=["Auto", "Nearest (pixel art)", "Lanczos (smooth)"],
+                        value="Auto",
+                        label="Resize Filter",
+                    )
                 with gr.Row():
                     gb_screen_resolution = gr.Button("GB Screen (160x144)")
                     original_resolution = gr.Button("Use Original Resolution(Image)")
@@ -973,6 +995,7 @@ def create_gradio_interface():
             enable_gothic_filter, brightness_threshold, dot_size, spacing, contrast_boost,
             noise_factor, edge_enhance, apply_blur, irregular_shape, irregular_size,
             reserve_ui_palette_checkbox, hw_dither_method, tile_budget_number, logo_subtype_radio,
+            resize_filter_dropdown,
         ]
 
         execute_button.click(run_in_task_executor(process_image),

@@ -211,6 +211,16 @@ def test_convert_is_deterministic():
     assert np.array_equal(np.asarray(a.image), np.asarray(b.image))
 
 
+def test_crop_is_center_anchored():
+    arr = np.zeros((20, 20, 3), dtype=np.uint8)
+    arr[2:18, 2:18] = 200   # center 16x16 block is bright
+    res = convert_for_hardware(Image.fromarray(arr, "RGB"), "mono")
+    out = np.asarray(res.image)
+    assert out.shape[:2] == (16, 16)
+    # Top-left crop would include 2 dark rows/cols; center crop keeps only bright.
+    assert len(np.unique(out.reshape(-1, 3), axis=0)) == 1
+
+
 # ---------------------------------------------------------------------------
 # logo preset
 

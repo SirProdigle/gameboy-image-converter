@@ -1525,9 +1525,11 @@ def convert_for_hardware(
     if nw < 1 or nh < 1:
         raise ValueError("image is smaller than one 8x8 tile")
     if (nw, nh) != (ow, oh):
-        img = img.crop((0, 0, nw, nh))
+        left = (ow - nw) // 2
+        top = (oh - nh) // 2
+        img = img.crop((left, top, left + nw, top + nh))
         warnings.append(
-            f"Input cropped from {ow}x{oh} to {nw}x{nh} "
+            f"Input center-cropped from {ow}x{oh} to {nw}x{nh} "
             "(dimensions must be multiples of 8)."
         )
 

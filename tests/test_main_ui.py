@@ -287,3 +287,10 @@ def test_mode_switch_to_color_unticks_custom_palette():
     for mode in (main.MODE_ARTISTIC, main.MODE_MONO, main.MODE_LOGO):
         upd = main.on_mode_change_custom_palette(mode)
         assert "value" not in upd
+
+
+def test_resize_filter_resolution():
+    assert main._resolve_resample("Auto", main.MODE_COLOR) == Image.LANCZOS
+    assert main._resolve_resample("Auto", main.MODE_ARTISTIC) == Image.NEAREST
+    assert main._resolve_resample("Nearest (pixel art)", main.MODE_COLOR) == Image.NEAREST
+    assert main._resolve_resample("Lanczos (smooth)", main.MODE_ARTISTIC) == Image.LANCZOS
