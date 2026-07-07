@@ -832,7 +832,7 @@ def create_gradio_interface():
                         hw_dither_method = gr.Dropdown(choices=list(HW_DITHER_METHODS.keys()),
                                                        label="Dither Method", value="None")
                     tile_budget_number = gr.Radio(
-                        choices=[("Mono + Colour (192)", 192), ("GBC only (384)", 384)],
+                        choices=[("Colour + Mono (192)", 192), ("Colour Only (384)", 384)],
                         value=384,
                         label="Tile budget",
                     )
