@@ -596,10 +596,14 @@ def index_tiles(
 
     For each pixel, finds the nearest palette entry in CIELAB -> index. With
     ``dither="bayer"``, instead picks between the two nearest palette entries:
-    letting d1/d2 be the distances to the nearest/second-nearest entry,
-    t = d1/(d1+d2) (0 when the pixel is an exact palette color); the pixel
-    takes the second-nearest entry's index iff t exceeds the 4x4 ordered
-    Bayer threshold anchored to the pixel's *absolute* image coordinates.
+    t is the pixel's projection onto the Lab segment from the nearest entry
+    (c1) to the second-nearest entry (c2), t = dot(pix - c1, c2 - c1) /
+    ||c2 - c1||^2, clamped to [0, 1] (0 when ``c1 == c2`` or the pixel's
+    projection falls at/behind c1). This keeps off-axis or out-of-range
+    pixels from speckling toward a color they aren't actually between. The
+    pixel takes the second-nearest entry's index iff t exceeds the 4x4
+    ordered Bayer threshold anchored to the pixel's *absolute* image
+    coordinates.
     No error diffusion -- dithering can never pick a color outside the
     tile's assigned 4-color palette, and is position-stable (dedup-friendly).
 
@@ -641,10 +645,13 @@ def index_tiles(
 
             if dither == "bayer":
                 idx2 = order[:, :, 1]
-                d1 = np.take_along_axis(dist, idx1[:, :, None], axis=2)[:, :, 0]
-                d2 = np.take_along_axis(dist, idx2[:, :, None], axis=2)[:, :, 0]
-                denom = d1 + d2
-                t_val = np.where(denom > 0, d1 / np.where(denom > 0, denom, 1.0), 0.0)
+                c1 = plab[idx1]  # (8,8,3)
+                c2 = plab[idx2]  # (8,8,3)
+                seg = c2 - c1  # (8,8,3)
+                seg_len2 = np.sum(seg * seg, axis=2)  # (8,8)
+                proj = np.sum((blab - c1) * seg, axis=2)
+                t_val = np.where(seg_len2 > 0, proj / np.where(seg_len2 > 0, seg_len2, 1.0), 0.0)
+                t_val = np.clip(t_val, 0.0, 1.0)
                 yy = tr * 8 + row_off
                 xx = tc * 8 + col_off
                 thresh = BAYER4[yy % 4, xx % 4]

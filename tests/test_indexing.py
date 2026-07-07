@@ -97,6 +97,43 @@ def test_absolute_coordinate_anchoring_identical_tiles_match():
     assert np.array_equal(gb.patterns[0], gb.patterns[3])
 
 
+def test_projection_dither_no_speckle_beyond_endpoints():
+    # Palette: mid-gray and dark-gray. Pixels are pure white -- beyond the
+    # light end of the segment. Old d1/(d1+d2) ratio dithered these; the
+    # projection must clamp t to 0 -> no dithering at all.
+    pal = np.array([[[128, 128, 128], [128, 128, 128],
+                     [64, 64, 64], [0, 0, 0]]], dtype=np.uint8)
+    pal = gb_pipeline.snap_rgb555(pal)
+    arr = np.full((8, 8, 3), 255, dtype=np.uint8)
+    assignment = np.zeros((1, 1), dtype=np.uint8)
+    gb = gb_pipeline.index_tiles(arr, pal, assignment, dither="bayer")
+    assert len(np.unique(gb.patterns)) == 1  # all pixels -> single nearest entry
+
+
+def test_projection_dither_midpoint_mixes():
+    # Entries 0/1 are a duplicated far-away filler color (never the nearest
+    # two -- with a fully-duplicated palette the two *nearest* entries are
+    # structurally guaranteed to be a duplicate pair of the *same* color,
+    # which is exactly the ||c2-c1||^2==0 guard case and correctly never
+    # dithers; that would not exercise the on-segment midpoint path this
+    # test targets). Entries 2/3 are the two genuinely distinct colors we
+    # place the pixel exactly between.
+    pal = np.array([[[255, 255, 255], [255, 255, 255],
+                     [200, 200, 200], [40, 40, 40]]], dtype=np.uint8)
+    pal = gb_pipeline.snap_rgb555(pal)
+    c1 = gb_pipeline._rgb_to_lab(pal[0, 2:3])[0]
+    c2 = gb_pipeline._rgb_to_lab(pal[0, 3:4])[0]
+    mid_lab = ((c1 + c2) / 2)[None, :]
+    mid_rgb = gb_pipeline._lab_to_rgb_u8(mid_lab)[0]
+    arr = np.tile(mid_rgb, (8, 8, 1)).astype(np.uint8)
+    assignment = np.zeros((1, 1), dtype=np.uint8)
+    gb = gb_pipeline.index_tiles(arr, pal, assignment, dither="bayer")
+    vals, counts = np.unique(gb.patterns, return_counts=True)
+    assert len(vals) == 2
+    assert set(vals.tolist()) == {2, 3}
+    assert 0.25 <= counts[0] / counts.sum() <= 0.75
+
+
 def test_output_values_all_in_0_to_3():
     rng = np.random.RandomState(42)
     image = rng.randint(0, 256, size=(16, 24, 3)).astype(np.uint8)
