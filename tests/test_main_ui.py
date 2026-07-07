@@ -10,6 +10,7 @@ GB Studio: Logo (both Color and Mono sub-toggles).
 """
 
 import os
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -241,3 +242,10 @@ def test_capture_original_dimensions_handles_none():
     out_img, width, height = main.capture_original_dimensions(img)
     assert out_img is img
     assert (width, height) == img.size
+
+
+def test_no_committed_secrets_or_shell_deletes():
+    src = Path(main.__file__).read_text()
+    assert "discord.com/api/webhooks" not in src
+    assert "boobiess" not in src
+    assert "os.system" not in src

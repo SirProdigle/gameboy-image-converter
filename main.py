@@ -8,6 +8,7 @@ from scipy.spatial import cKDTree
 from numpy import std
 import random
 import os
+import shutil
 import zipfile
 import threading
 import time
@@ -46,10 +47,7 @@ logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
 logger.addHandler(handler)
 
-HEARTBEAT_WEBHOOK_URL = os.environ.get(
-    "HEARTBEAT_WEBHOOK_URL",
-    "https://canary.discord.com/api/webhooks/1425053965934137449/p_K0PCtdgM8uuZw34VxCXBr7NKZdkQVgmj-mJfZDqHim4irOuibcLfUFLI3J2_KWVYJb",
-)
+HEARTBEAT_WEBHOOK_URL = os.environ.get("HEARTBEAT_WEBHOOK_URL", "")
 HEARTBEAT_MESSAGE_FILE = Path("heartbeat_status.json")
 HEARTBEAT_INTERVAL_SECONDS = 10
 QUEUE_ALERT_THRESHOLD = 15
@@ -61,6 +59,7 @@ task_executor = TaskExecutor(task_metrics, max_workers=2)
 heartbeat_monitor: Optional[HeartbeatMonitor] = None
 
 active_tasks = 0
+active_tasks_lock = threading.Lock()
 
 @contextmanager
 def task_log(task_type="image_convert"):
@@ -69,7 +68,9 @@ def task_log(task_type="image_convert"):
     start_time = time.time()
     success = True
 
-    active_tasks += 1
+    with active_tasks_lock:
+        active_tasks += 1
+        active_snapshot = active_tasks
     task_metrics.task_started(task_id, task_type)
 
     logger.info(json.dumps({
@@ -77,7 +78,7 @@ def task_log(task_type="image_convert"):
         "task_id": task_id,
         "task_type": task_type,
         "timestamp": start_time,
-        "active_tasks": active_tasks,
+        "active_tasks": active_snapshot,
     }))
 
     try:
@@ -88,7 +89,9 @@ def task_log(task_type="image_convert"):
     finally:
         end_time = time.time()
         duration = end_time - start_time
-        active_tasks = max(active_tasks - 1, 0)
+        with active_tasks_lock:
+            active_tasks = max(active_tasks - 1, 0)
+            active_snapshot = active_tasks
         task_metrics.task_finished(task_id, task_type, duration, success=success)
 
         logger.info(json.dumps({
@@ -97,7 +100,7 @@ def task_log(task_type="image_convert"):
             "task_type": task_type,
             "timestamp": end_time,
             "duration": duration,
-            "active_tasks": active_tasks,
+            "active_tasks": active_snapshot,
         }))
 
 
@@ -729,7 +732,7 @@ def process_image_folder(input_files, mode, width, height, aspect_ratio,
             return os.path.join(os.getcwd(), folder_name, folder_name + ".zip"), "\n\n".join(text_for_palette), None, None
 
         except Exception as e:
-            os.system("rm -rf " + folder_name)
+            shutil.rmtree(folder_name, ignore_errors=True)
             print(traceback.format_exc())
             return None, "Error processing folder " + str(e), None, None
 
@@ -970,11 +973,11 @@ def clear_temporary_files():
         if folder.startswith("output_"):
             # get last modified date
             last_modified = os.path.getmtime(folder)
-            # if the folder was last modified more than 1 hour ago, delete it
+            # if the folder was last modified more than 10 minutes ago, delete it
             if (time.time() - last_modified) > 600:
                 # Delete folder and all files inside
                 try:
-                    os.system("rm -rf " + folder)
+                    shutil.rmtree(folder, ignore_errors=True)
                 except Exception as e:
                     print("Error deleting folder " + folder + ": " + str(e))
 
@@ -994,5 +997,4 @@ if __name__ == "__main__":
     else:
         logger.warning("Heartbeat monitor disabled because HEARTBEAT_WEBHOOK_URL is not set")
     demo: gr.Blocks = create_gradio_interface()
-    # use http basic auth with password of boobiess
     demo.launch(share=False, server_name="0.0.0.0", server_port=7860)
