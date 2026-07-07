@@ -725,8 +725,23 @@ def index_tiles(
     attrs_vflip = np.zeros((th, tw), dtype=bool)
 
     # Lab conversion happens once for the unique colors and once for the
-    # palettes; per-pixel work is a set of vectorized table gathers.
-    uq, inv = np.unique(arr.reshape(-1, 3), axis=0, return_inverse=True)
+    # palettes; per-pixel work is a set of vectorized table gathers. Unique
+    # colors are found by packing RGB into a single uint32 key -- a 1-D
+    # ``np.unique`` on the packed keys is far cheaper than an ``axis=0`` unique
+    # over the (N, 3) array (which lexsorts a struct view) and, because red is
+    # the most-significant byte, yields byte-identical unique colors and the
+    # same inverse index.
+    flat = arr.reshape(-1, 3)
+    key = (
+        (flat[:, 0].astype(np.uint32) << 16)
+        | (flat[:, 1].astype(np.uint32) << 8)
+        | flat[:, 2].astype(np.uint32)
+    )
+    ukey, inv = np.unique(key, return_inverse=True)
+    uq = np.empty((ukey.shape[0], 3), dtype=np.uint8)
+    uq[:, 0] = (ukey >> 16) & 0xFF
+    uq[:, 1] = (ukey >> 8) & 0xFF
+    uq[:, 2] = ukey & 0xFF
     pal_lab = np.stack([_rgb_to_lab(pp) for pp in palettes])  # (p, 4, 3)
     pcol = np.arange(p)[None, :]
 
@@ -737,16 +752,31 @@ def index_tiles(
     for lo in range(0, n_uq, 8192):
         hi_ = min(lo + 8192, n_uq)
         ulab = _rgb_to_lab(uq[lo:hi_])  # (m, 3)
-        diff = ulab[:, None, None, :] - pal_lab[None, :, :, :]  # (m, p, 4, 3)
-        dist = np.sqrt(np.sum(diff * diff, axis=3))  # (m, p, 4)
-        order = np.argsort(dist, axis=2, kind="stable")  # nearest-first
+        # Squared Lab distance from every unique color to every palette entry,
+        # accumulated channel-by-channel to avoid materializing the (m, p, 4, 3)
+        # difference/product tensors -- same arithmetic and evaluation order as
+        # ``np.sum(diff * diff, axis=3)``, so byte-identical. The sqrt is
+        # dropped: it is monotonic, so ``argsort`` yields the same nearest-first
+        # order (and ties stay ties).
+        d0 = ulab[:, None, None, 0] - pal_lab[None, :, :, 0]  # (m, p, 4)
+        d1 = ulab[:, None, None, 1] - pal_lab[None, :, :, 1]
+        d2 = ulab[:, None, None, 2] - pal_lab[None, :, :, 2]
+        dist2 = d0 * d0 + d1 * d1 + d2 * d2  # (m, p, 4)
+        order = np.argsort(dist2, axis=2, kind="stable")  # nearest-first
         i1 = order[:, :, 0]
         i2 = order[:, :, 1]
         c1 = pal_lab[pcol, i1]  # (m, p, 3)
         c2 = pal_lab[pcol, i2]  # (m, p, 3)
         seg = c2 - c1
-        seg_len2 = np.sum(seg * seg, axis=2)  # (m, p)
-        proj = np.sum((ulab[:, None, :] - c1) * seg, axis=2)
+        s0 = seg[:, :, 0]
+        s1 = seg[:, :, 1]
+        s2 = seg[:, :, 2]
+        seg_len2 = s0 * s0 + s1 * s1 + s2 * s2  # (m, p)
+        proj = (
+            (ulab[:, None, 0] - c1[:, :, 0]) * s0
+            + (ulab[:, None, 1] - c1[:, :, 1]) * s1
+            + (ulab[:, None, 2] - c1[:, :, 2]) * s2
+        )
         t = np.where(seg_len2 > 0, proj / np.where(seg_len2 > 0, seg_len2, 1.0), 0.0)
         idx1_t[lo:hi_] = i1
         idx2_t[lo:hi_] = i2
