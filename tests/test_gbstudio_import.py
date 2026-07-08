@@ -148,3 +148,59 @@ def test_convert_for_hardware_mono_skips_gbstudio_color_stats(photo_like_image):
     from gb_pipeline import convert_for_hardware
     res = convert_for_hardware(photo_like_image, "mono")
     assert "gbstudio_palettes_extracted" not in res.stats
+
+
+def _mono_tile(green_row):
+    """Build an 8x8x3 RGB tile: every row repeats ``green_row`` (8 green
+    values), r/b held constant so only the green channel drives bucketing."""
+    tile = np.zeros((8, 8, 3), dtype=np.uint8)
+    tile[..., 1] = np.array(green_row, dtype=np.uint8)[None, :]
+    return tile
+
+
+def test_mono_stats_counts_flips_as_distinct_tiles():
+    """GB Studio's mono importer (unlike its color autoFlipTiles) does NOT
+    dedup horizontal/vertical flips: two pixel-identical tiles collapse to
+    one, but a third that is only a horizontal flip of the first stays
+    distinct -> 2 unique tiles total."""
+    green_row = [10, 90, 150, 220, 10, 90, 150, 220]  # asymmetric -> flip != original
+    tile_a = _mono_tile(green_row)
+    tile_b = _mono_tile(green_row)  # pixel-identical to tile_a
+    tile_c = _mono_tile(green_row[::-1])  # horizontal flip of tile_a
+
+    arr = np.concatenate([tile_a, tile_b, tile_c], axis=1)  # 8x24x3
+    stats = gsi.gbstudio_mono_stats(arr)
+    assert stats.tiles == 2
+
+
+def test_mono_tile_indices_bucket_thresholds_correctly():
+    """Green values straddling the 65/130/205 thresholds must bucket exactly
+    as _green_index defines: <65->3, <130->2, <205->1, else->0."""
+    green_row = [0, 64, 65, 129, 130, 204, 205, 255]
+    tile = _mono_tile(green_row)
+    idx = gsi._mono_tile_indices(tile)
+    expected_row = [3, 3, 2, 2, 1, 1, 0, 0]
+    assert list(idx[0]) == expected_row
+    # Every row is identical (green_row broadcast), so the whole tile matches.
+    assert (idx == np.array(expected_row, dtype=np.uint8)).all()
+
+
+def test_mono_ramp_green_buckets_dmg_ramp_is_distinct():
+    """DMG_RAMP's 4 shades must land in 4 distinct green buckets, or GB
+    Studio's fixed-threshold mono import would merge shades on its own."""
+    from gb_pipeline import DMG_RAMP
+    buckets = gsi.mono_ramp_green_buckets(DMG_RAMP)
+    assert len(buckets) == 4
+    assert len(set(buckets)) == 4
+
+
+def test_mono_ramp_green_buckets_detects_collision():
+    """A degenerate custom ramp with two shades whose green values (150, 200)
+    both fall under the <205 threshold collides into the same bucket (1)."""
+    ramp = np.array(
+        [[255, 255, 255], [0, 150, 0], [0, 200, 0], [0, 0, 0]],
+        dtype=np.uint8,
+    )
+    buckets = gsi.mono_ramp_green_buckets(ramp)
+    assert len(set(buckets)) < 4
+    assert buckets[1] == buckets[2] == 1

@@ -377,6 +377,47 @@ def gbstudio_report(stats: GBStudioStats, budget):
     return warnings, extra
 
 
+def _mono_tile_indices(tile_rgb: np.ndarray) -> np.ndarray:
+    """Per-pixel GB Studio mono green-threshold index (0-3) for an 8x8 RGB
+    tile, via the same fixed ``_green_index`` buckets the color path uses."""
+    tile_rgb = np.asarray(tile_rgb, dtype=np.uint8)
+    idx = np.zeros((8, 8), dtype=np.uint8)
+    for y in range(8):
+        for x in range(8):
+            idx[y, x] = _green_index(int(tile_rgb[y, x, 1]))
+    return idx
+
+
+@dataclass
+class GBStudioMonoStats:
+    tiles: int
+
+
+def gbstudio_mono_stats(arr: np.ndarray) -> GBStudioMonoStats:
+    """GB Studio's Mono/DMG background import tile counting: per-tile
+    green-threshold indices (``_green_index``), packed to 2bpp, deduped by
+    exact bytes. Unlike the color path's ``autoFlipTiles``, GB Studio's mono
+    importer does NOT collapse horizontal/vertical flips."""
+    arr = np.asarray(arr, dtype=np.uint8)
+    h, w = arr.shape[:2]
+    xt, yt = w // 8, h // 8
+    lookup = set()
+    for ty in range(yt):
+        for tx in range(xt):
+            block = arr[ty * 8:ty * 8 + 8, tx * 8:tx * 8 + 8]
+            lookup.add(tile_to_2bpp(_mono_tile_indices(block)))
+    return GBStudioMonoStats(tiles=len(lookup))
+
+
+def mono_ramp_green_buckets(ramp) -> list:
+    """Green-channel bucket (``_green_index``) for each entry of a 4-shade
+    mono ramp, so callers can detect a custom ramp whose shades collide under
+    GB Studio's fixed thresholds (non-distinct buckets -> shades silently
+    merge on import)."""
+    ramp = np.asarray(ramp, dtype=np.uint8)
+    return [_green_index(int(ramp[i, 1])) for i in range(len(ramp))]
+
+
 def tile_to_2bpp(tile: np.ndarray) -> bytes:
     """Pack an 8x8 array of 0-3 indices to GB 2bpp (16 bytes).
 
