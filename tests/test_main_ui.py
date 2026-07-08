@@ -371,3 +371,50 @@ def test_hardware_notice_safety_net_still_warns_on_corruption():
     notice = main._format_hardware_notice(result)
     assert "⚠️ 12 tiles recolored" in notice
     assert "adapted for import" not in notice
+
+
+# --- limit_colors libimagequant guard ---------------------------------------
+
+
+def _flat_art_image():
+    """Multi-color flat-art-like input (the class libimagequant collapses)."""
+    from PIL import ImageDraw
+
+    img = Image.new("RGB", (64, 64), (250, 248, 246))
+    d = ImageDraw.Draw(img)
+    d.ellipse([8, 8, 48, 48], fill=(214, 160, 155))
+    d.ellipse([20, 20, 36, 36], fill=(120, 70, 75))
+    return img.resize((32, 32), Image.LANCZOS)
+
+
+def test_limit_colors_falls_back_when_libimagequant_unavailable():
+    """Dev wheels lack libimagequant: requesting it must not raise but fall
+    back to MEDIANCUT (prod images have the feature; dev must still work)."""
+    img = _flat_art_image()
+    out = main.limit_colors(
+        img, limit=16, quantize=Image.Quantize.LIBIMAGEQUANT, dither=Image.Dither.NONE
+    )
+    colors = np.unique(np.asarray(out.convert("RGB")).reshape(-1, 3), axis=0)
+    assert len(colors) > 1
+
+
+def test_limit_colors_retries_mediancut_on_flat_collapse(monkeypatch):
+    """Prod libimagequant collapses flat art to ONE color: the guard must
+    detect a single-color palette from a multi-color source and requantize
+    with MEDIANCUT."""
+    real_quantize = Image.Image.quantize
+
+    def broken_quantize(self, *args, **kwargs):
+        if kwargs.get("method") == Image.Quantize.LIBIMAGEQUANT:
+            flat = Image.new("RGB", self.size, (66, 115, 74))  # the green screen
+            return real_quantize(flat, colors=kwargs.get("colors", 256))
+        return real_quantize(self, *args, **kwargs)
+
+    monkeypatch.setattr(Image.Image, "quantize", broken_quantize)
+    img = _flat_art_image()
+    out = main.limit_colors(
+        img, limit=16, quantize=Image.Quantize.LIBIMAGEQUANT, dither=Image.Dither.NONE
+    )
+    colors = np.unique(np.asarray(out.convert("RGB")).reshape(-1, 3), axis=0)
+    assert len(colors) > 1
+    assert [66, 115, 74] not in colors.tolist()

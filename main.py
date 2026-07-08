@@ -419,10 +419,30 @@ def limit_colors(image, limit=16, quantize=None, dither=None, palette_image=None
         ppalette = palette_image.getcolors()
         color_palette = palette_image.quantize(colors=len(list(set(ppalette))))
     else:
-        color_palette = image.quantize(colors=limit, kmeans=limit if limit else 0, method=quantize,
-                                       dither=dither)
+        color_palette = _quantize_guarded(image, limit, quantize, dither)
     image = image.quantize(palette=color_palette, dither=dither)
     return image
+
+
+def _quantize_guarded(image, limit, quantize, dither):
+    """Quantize with the requested method, falling back to MEDIANCUT when it
+    is unavailable (dev Pillow wheels lack libimagequant) or when it collapses
+    a multi-color image to a single-color palette (the production
+    libimagequant build does exactly that on downscaled flat art -- the
+    green-screen bug; see gb_pipeline.quantize_working_set)."""
+    kmeans = limit if limit else 0
+    try:
+        palette = image.quantize(colors=limit, kmeans=kmeans, method=quantize, dither=dither)
+        collapsed = (
+            len(palette.getcolors() or []) <= 1
+            and image.convert("RGB").getcolors(1) is None  # source has >1 color
+        )
+        if not collapsed:
+            return palette
+    except (ValueError, OSError):
+        pass
+    return image.quantize(colors=limit, kmeans=kmeans,
+                          method=Image.Quantize.MEDIANCUT, dither=dither)
 
 
 def create_palette_from_colors(color_list):
