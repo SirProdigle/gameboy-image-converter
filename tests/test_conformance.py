@@ -18,6 +18,7 @@ from PIL import Image, ImageFilter
 
 import gb_pipeline as gp
 import gb_studio_import as gsi
+from tests.conftest import make_photo_like_image
 
 FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures")
 
@@ -140,3 +141,38 @@ def test_clean_image_no_recolor_identical(photo_like_image):
         np.asarray(res.image.convert("RGB")),
         np.asarray(res.reference.convert("RGB")),
     )
+
+
+# -- (e) sweep: final oracle verdict holds across size x dither x preset ------
+
+SWEEP_SIZES = [(160, 144), (320, 288)]
+SWEEP_DITHERS = ["none", "bayer"]
+SWEEP_PRESETS = ["color_only", "mono"]
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("preset", SWEEP_PRESETS)
+@pytest.mark.parametrize("dither", SWEEP_DITHERS)
+@pytest.mark.parametrize("size", SWEEP_SIZES, ids=["160x144", "320x288"])
+def test_sweep_final_oracle_verdict(size, dither, preset):
+    """Exhaustive combinatorial sweep of the conform loop's guarantee: for
+    every (size, dither, preset) combo, the SHIPPED render (``res.image``) is
+    a GB Studio-clean fixed point -- tiles within budget, and for color, <=8
+    extracted palettes with zero corruption. Each combo gets its own
+    deterministic seed (photo-like generator) so a failure reproduces."""
+    width, height = size
+    seed = hash((width, height, dither, preset)) & 0xFFFF
+    img = make_photo_like_image(width=width, height=height, seed=seed)
+
+    res = gp.convert_for_hardware(img, preset, dither=dither)
+    budget = gp.PRESETS[preset].tile_budget
+    out_arr = np.asarray(res.image.convert("RGB"), np.uint8)
+
+    if preset == "mono":
+        mono_stats = gsi.gbstudio_mono_stats(out_arr)
+        assert mono_stats.tiles <= budget
+    else:
+        color_stats = gsi.gbstudio_color_stats(out_arr)
+        assert color_stats.tiles_autoflip <= budget
+        assert color_stats.palettes_extracted <= 8
+        assert color_stats.corrupted_tiles == 0

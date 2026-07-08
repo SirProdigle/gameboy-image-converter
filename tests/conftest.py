@@ -15,6 +15,18 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GB_PALETTE_PATH = os.path.join(REPO_ROOT, "gb_palette.png")
 
 
+def pytest_configure(config):
+    """Register custom markers so ``@pytest.mark.slow`` doesn't warn.
+
+    No pytest.ini/pyproject.toml exists yet for this project; registering
+    here keeps marker declarations next to the fixtures that use them.
+    """
+    config.addinivalue_line(
+        "markers",
+        "slow: exhaustive/combinatorial tests (deselect with `-m 'not slow'`)",
+    )
+
+
 @pytest.fixture
 def checker_tile() -> np.ndarray:
     """8x8 two-color checkerboard pattern, values alternating 0/1.
@@ -46,15 +58,17 @@ def flat_image() -> Image.Image:
     return Image.fromarray(arr, mode="RGB")
 
 
-@pytest.fixture
-def photo_like_image() -> Image.Image:
-    """160x144 deterministic multi-region gradient + noise image.
+def make_photo_like_image(width: int = 160, height: int = 144, seed: int = 42) -> Image.Image:
+    """Deterministic multi-region gradient + noise image at any (width, height).
 
     Built from a fixed numpy seed so results are reproducible across runs
-    (used for golden-count style tests in later tasks).
+    (used for golden-count style tests, and the GB Studio conformance sweep).
+    Factored out of the ``photo_like_image`` fixture so callers needing other
+    sizes/seeds (e.g. a 320x288 sweep) can reuse the exact same generator;
+    the fixture's defaults (160, 144, 42) reproduce its original output
+    byte-for-byte.
     """
-    width, height = 160, 144
-    rng = np.random.RandomState(42)
+    rng = np.random.RandomState(seed)
 
     yy, xx = np.mgrid[0:height, 0:width]
 
@@ -102,6 +116,16 @@ def photo_like_image() -> Image.Image:
     arr = np.clip(arr + noise, 0, 255).astype(np.uint8)
 
     return Image.fromarray(arr, mode="RGB")
+
+
+@pytest.fixture
+def photo_like_image() -> Image.Image:
+    """160x144 deterministic multi-region gradient + noise image.
+
+    Thin wrapper around ``make_photo_like_image`` at its default size/seed
+    (used for golden-count style tests).
+    """
+    return make_photo_like_image()
 
 
 @pytest.fixture
