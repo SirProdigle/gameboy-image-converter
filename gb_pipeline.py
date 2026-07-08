@@ -1478,6 +1478,118 @@ def _palette_hex(palettes: np.ndarray) -> list:
     ]
 
 
+@dataclass
+class _ConformResult:
+    """Outcome of ``_conform_to_gbstudio``: the GB-Studio-conformed candidate."""
+
+    gb: GBImage              # final post-merge GBImage (matches base_image)
+    image: np.ndarray        # shipped RGB pixels -- pixel-exact GB import
+    base_image: np.ndarray   # pre-recolor render of ``gb`` (for verify_roundtrip)
+    tiles: int               # GB Studio's final tile count (its oracle)
+    palettes_extracted: int  # color: GB's palette count; mono: 0 (n/a)
+    corrupted_tiles: int     # 0 by construction on success
+    n_recolored: int         # tiles we recolored to fit the 8-palette import
+    n_merges: int            # merges in the final candidate (heavy-merge signal)
+    p95: float               # p95 merge dE of the final candidate
+    n_pal_final: int         # master palettes used (fallback ladder may drop it)
+    exhausted: bool          # fallback ladder ran out (safety net; unexpected)
+
+
+def _conform_to_gbstudio(pack_stage, ps: Preset, budget, n_palettes: int) -> _ConformResult:
+    """Conform the rendered candidate to GB Studio v4.3.2's real importer.
+
+    ``pack_stage(n_pal)`` re-runs the candidate-generation stages
+    (quantize/pack/index/dedup) for ``n_pal`` master palettes and returns the
+    pre-merge GBImage; it is memoized by the caller so the tile loop, which only
+    tightens the merge target, does not repack. The shipped PNG is then
+    pixel-exact what GB reconstructs on import (corruption 0 by construction).
+
+    Control flow (design 2026-07-08):
+
+    * **Tile loop** (max 5 candidates, skipped for logo -- GB exempts logo tiles
+      from its dedup): render at ``target``, measure GB's real tile count; if it
+      overshoots ``budget``, drop ``target`` by the overshoot and re-merge.
+    * **Palette conform** (color + logo_color, max 4): while GB extracts >8
+      palettes, recolor the overflow tiles ourselves (best-fit, ``recolor_overflow``)
+      and re-measure. Recoloring is deterministic per pixel-content and can only
+      shrink the tile count, so it never undoes the tile loop.
+    * **Fallback ladder**: if still >8 palettes, repack with one fewer master and
+      restart -- provably converges (at ``n_pal == 1`` every tile is a subset of
+      the single master, so GB extracts <=1 palette). If somehow exhausted,
+      return the tightest attempt flagged ``exhausted`` so the caller keeps
+      today's honest warning instead of shipping a false guarantee.
+
+    Mono runs only the tile loop with the mono oracle (green-threshold indices,
+    no flips) -- no palettes/recoloring.
+    """
+    is_logo = ps.fixed_size is not None
+    _pre: dict = {}
+
+    def candidate(target, n_pal):
+        pre_gb = _pre.get(n_pal)
+        if pre_gb is None:
+            pre_gb = pack_stage(n_pal)
+            _pre[n_pal] = pre_gb
+        if is_logo or budget is None:
+            gb, n_merges = pre_gb, 0
+        else:
+            gb, n_merges = merge_to_budget(pre_gb, target, ps.allow_flips)
+        arr = np.asarray(render(gb), dtype=np.uint8)
+        p95 = float(getattr(gb, "merge_p95_delta_e", 0.0))
+        return gb, arr, n_merges, p95
+
+    if ps.mono:
+        target = budget
+        gb, arr, n_merges, p95 = candidate(target, 1)
+        s = gb_studio_import.gbstudio_mono_stats(arr)
+        for _ in range(4):  # <=5 candidates total
+            if budget is None or s.tiles <= budget:
+                break
+            target = max(1, target - (s.tiles - budget))
+            gb, arr, n_merges, p95 = candidate(target, 1)
+            s = gb_studio_import.gbstudio_mono_stats(arr)
+        return _ConformResult(
+            gb=gb, image=arr, base_image=arr, tiles=int(s.tiles),
+            palettes_extracted=0, corrupted_tiles=0, n_recolored=0,
+            n_merges=n_merges, p95=p95, n_pal_final=1, exhausted=False,
+        )
+
+    # Color / logo_color: tile loop then palette conform, wrapped in the
+    # one-fewer-master fallback ladder.
+    last = None
+    for n_pal in range(n_palettes, 0, -1):
+        target = budget
+        gb, arr, n_merges, p95 = candidate(target, n_pal)
+        s = gb_studio_import.gbstudio_color_stats(arr)
+        for _ in range(4):  # <=5 candidates total
+            if budget is None or s.tiles_autoflip <= budget:
+                break
+            target = max(1, target - (s.tiles_autoflip - budget))
+            gb, arr, n_merges, p95 = candidate(target, n_pal)
+            s = gb_studio_import.gbstudio_color_stats(arr)
+
+        base_arr = arr  # matches gb exactly (pre-recolor) -> verify_roundtrip
+        n_recolored = 0
+        for _ in range(4):
+            if s.palettes_extracted <= 8:
+                break
+            arr, n = gb_studio_import.recolor_overflow(arr)
+            n_recolored += n
+            s = gb_studio_import.gbstudio_color_stats(arr)
+
+        last = _ConformResult(
+            gb=gb, image=arr, base_image=base_arr, tiles=int(s.tiles_autoflip),
+            palettes_extracted=int(s.palettes_extracted),
+            corrupted_tiles=int(s.corrupted_tiles), n_recolored=n_recolored,
+            n_merges=n_merges, p95=p95, n_pal_final=n_pal, exhausted=False,
+        )
+        if s.palettes_extracted <= 8:
+            return last
+    # Fallback ladder exhausted (not expected to be reachable): keep the last,
+    # tightest attempt but flag it so the caller falls back to an honest warning.
+    return replace(last, exhausted=True)
+
+
 def convert_for_hardware(
     image: Image.Image,
     preset: str,
@@ -1546,44 +1658,60 @@ def convert_for_hardware(
             )
 
     orig_arr = np.asarray(img, dtype=np.uint8)
+    budget = tile_budget if tile_budget is not None else ps.tile_budget
 
-    if ps.mono:
-        # Mono skips the working-set quantizer entirely: the luminance path
-        # dithers continuous tone straight to the 4-level ramp.
-        ramp = DMG_RAMP if mono_ramp is None else np.asarray(mono_ramp, dtype=np.uint8)
-        palettes, _ = pack_palettes_mono(orig_arr, ramp)
-        gb = _index_tiles_mono(orig_arr, palettes, dither)
-    else:
-        quantized = quantize_working_set(
-            img, min(4 * n_palettes * WORKING_SET_FACTOR, 128), custom_palette
-        )
-        arr = np.asarray(quantized, dtype=np.uint8)
-        palettes, assignment = pack_palettes(arr, n_palettes, custom_palette)
-        # Palette packing runs on the quantized working set, but per-pixel
-        # indexing/dithering reads the ORIGINAL pixels so nearest-entry mapping
-        # and Bayer dithering see real gradients instead of the quantizer's
-        # coarse steps.
-        gb = index_tiles(orig_arr, palettes, assignment, dither)
+    # Candidate generation (quantize/pack/index/dedup) as a re-runnable stage so
+    # the conform loop can retry at a tightened tile target or with fewer master
+    # palettes without redoing the input prep above. Memoized by n_pal (the tile
+    # loop only re-merges the cached pre-merge candidate).
+    _pack_cache: dict = {}
 
-    if not is_logo:
-        gb = dedup_patterns(gb, ps.allow_flips)
+    def pack_stage(n_pal):
+        cached = _pack_cache.get(n_pal)
+        if cached is not None:
+            return cached
+        if ps.mono:
+            # Mono skips the working-set quantizer entirely: the luminance path
+            # dithers continuous tone straight to the 4-level ramp (n_pal n/a).
+            ramp = DMG_RAMP if mono_ramp is None else np.asarray(mono_ramp, dtype=np.uint8)
+            pals, _ = pack_palettes_mono(orig_arr, ramp)
+            g = _index_tiles_mono(orig_arr, pals, dither)
+        else:
+            quantized = quantize_working_set(
+                img, min(4 * n_pal * WORKING_SET_FACTOR, 128), custom_palette
+            )
+            a = np.asarray(quantized, dtype=np.uint8)
+            pals, assignment = pack_palettes(a, n_pal, custom_palette)
+            # Palette packing runs on the quantized working set, but per-pixel
+            # indexing/dithering reads the ORIGINAL pixels so nearest-entry
+            # mapping and Bayer dithering see real gradients instead of the
+            # quantizer's coarse steps.
+            g = index_tiles(orig_arr, pals, assignment, dither)
+        if not is_logo:
+            g = dedup_patterns(g, ps.allow_flips)
+        _pack_cache[n_pal] = g
+        return g
 
-    reference_gb = gb
+    # Pre-merge reference render (natural, un-conformed compare) -- unchanged.
+    reference_gb = pack_stage(n_palettes)
     reference_img = render(reference_gb)
 
-    budget = tile_budget if tile_budget is not None else ps.tile_budget
-    n_merges = 0
-    p95 = 0.0
-    if not is_logo and budget is not None:
-        gb, n_merges = merge_to_budget(gb, budget, ps.allow_flips)
-        p95 = float(getattr(gb, "merge_p95_delta_e", 0.0))
+    # Oracle-in-the-loop conformance: tighten tiles / recolor palettes until GB
+    # Studio's own importer measures the shipped PNG as GB-legal (corruption 0).
+    cr = _conform_to_gbstudio(pack_stage, ps, budget, n_palettes)
+    final_gb = cr.gb
+    final_img = Image.fromarray(cr.image, "RGB")
 
-    final_img = render(gb)
+    # Independent structural round-trip on the pre-recolor candidate (its render
+    # matches final_gb exactly): palette count/limit, RGB555 stability, tile
+    # colors subset of one stored palette, logo cell-count. The returned deduped
+    # re-import count is tiles_used for logo (GB stores logo tiles sequentially,
+    # exempt from its tile dedup); color/mono report GB's own conformed count.
+    base_img = Image.fromarray(cr.base_image, "RGB")
+    n_reimport = verify_roundtrip(base_img, replace(ps, n_palettes=n_palettes), final_gb)
 
-    # Independent round-trip verification against the effective palette limit.
-    # The verifier returns the independently re-imported tile count -- the true
-    # number GB Studio's importer would store -- which is what the UI reports.
-    n_reimport = verify_roundtrip(final_img, replace(ps, n_palettes=n_palettes), gb)
+    n_merges = cr.n_merges
+    p95 = cr.p95
 
     if n_merges > 0 and p95 > _HEAVY_MERGE_P95_DELTA_E:
         warnings.append(
@@ -1591,39 +1719,56 @@ def convert_for_hardware(
             "simplify the image, or disable dithering to reduce quality loss."
         )
 
-    if budget is not None and n_reimport > budget:
+    if budget is not None and cr.tiles > budget:
         warnings.append(
-            f"Verified tile count {n_reimport} exceeds the {budget} budget "
+            f"Verified tile count {cr.tiles} exceeds the {budget} budget "
             "after import -- raise the budget or simplify the image."
         )
 
     stats = {
-        "tiles_used": n_reimport,
+        "tiles_used": n_reimport if budget is None else int(cr.tiles),
         "tile_budget": budget,
-        "palettes_used": int(gb.palettes.shape[0]),
+        "palettes_used": int(final_gb.palettes.shape[0]),
         "n_merges": int(n_merges),
         "p95_delta_e": p95,
         "preset": ps.name,
         "dither": dither,
     }
 
-    # Honest cross-check against GB Studio's *actual* Color-Only importer: it
-    # re-derives palettes/tiles from the rendered pixels with a different
-    # algorithm than verify_roundtrip, so it can extract >8 palettes (silently
-    # recoloring the overflow) or count more tiles than we think. Report those
-    # real numbers and warn. (Mono uses the DMG path, which round-trips cleanly.)
-    if not ps.mono:
-        gs_stats = gb_studio_import.gbstudio_color_stats(
-            np.asarray(final_img.convert("RGB"), dtype=np.uint8)
-        )
-        gs_warnings, gs_extra = gb_studio_import.gbstudio_report(gs_stats, budget)
-        warnings.extend(gs_warnings)
-        stats.update(gs_extra)
+    if ps.mono:
+        # A custom mono ramp whose shades share a GB Studio green bucket would
+        # silently merge on import (its fixed 65/130/205 thresholds ignore our
+        # ramp); warn on the stored (as-imported) ramp.
+        if mono_ramp is not None:
+            buckets = gb_studio_import.mono_ramp_green_buckets(final_gb.palettes[0])
+            if len(set(buckets)) < len(buckets):
+                warnings.append(
+                    "Custom mono ramp has shades sharing a GB Studio green "
+                    "bucket -- those shades will merge on GB Studio import; "
+                    "spread the ramp's green channel across the 65/130/205 "
+                    "thresholds."
+                )
+    else:
+        # GB Studio's real Color-Only importer, measured on the CONFORMED render:
+        # corruption is 0 by construction and palettes are <=8, so the old ">8
+        # palettes will recolor" warning no longer fires. Surface the honest
+        # counts plus how many tiles we adapted (recolored) to fit the import.
+        stats["gbstudio_tiles"] = int(cr.tiles)
+        stats["gbstudio_palettes_extracted"] = int(cr.palettes_extracted)
+        stats["gbstudio_corrupted_tiles"] = int(cr.corrupted_tiles)
+        stats["gbstudio_recolored_tiles"] = int(cr.n_recolored)
+        if cr.exhausted:
+            # Safety net (not expected to be reachable): the fallback ladder
+            # could not reach a GB-legal import; keep today's honest warning
+            # rather than ship a false guarantee.
+            gs_stats = gb_studio_import.gbstudio_color_stats(cr.image)
+            gs_warnings, _ = gb_studio_import.gbstudio_report(gs_stats, budget)
+            warnings.extend(gs_warnings)
 
     return ConversionResult(
         image=final_img,
         reference=reference_img,
         stats=stats,
         warnings=warnings,
-        palette_hex=_palette_hex(gb.palettes),
+        palette_hex=_palette_hex(final_gb.palettes),
     )

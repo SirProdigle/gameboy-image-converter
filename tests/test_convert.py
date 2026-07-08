@@ -289,16 +289,18 @@ def test_golden_counts_photo_like(photo_like_image):
 # Golden values observed on the first green run; see test above. Regenerate
 # deliberately (and review the diff) only if the pipeline math changes.
 GOLDEN = {
-    # For color/mono, tiles_used is the independently verified (deduped)
-    # re-import count (spec Stage 7.2) -- the number of tiles GB Studio's
-    # importer would store, not the pipeline's internal pattern count. For logo,
-    # tiles are stored sequentially with no dedup, so tiles_used is the cell
-    # count (th*tw).
+    # For color/mono, tiles_used is now GB Studio's own conformed import count
+    # (its real importer, oracle-in-the-loop) -- the number of tiles GB Studio
+    # stores, not the pipeline's internal pattern count. For logo, tiles are
+    # stored sequentially with no dedup, so tiles_used is the cell count (th*tw).
     "color_tiles": 360,     # 360 cells (20x18); indexing from original pixels
                             #   (Task 4) dedups less than the quantized source did
                             #   -- still under the 384 budget
     "color_palettes": 7,    # reserve_ui_palette caps color at 7
-    "mono_tiles": 189,  # continuous-luminance dither yields more distinct tiles
+    "mono_tiles": 192,  # GB Studio's mono importer (fixed green buckets, no flip
+                        #   dedup) counts 192 where our verify_roundtrip's
+                        #   luminance-reindex collapsed to 189 -- conform reports
+                        #   GB's number (still within the 192 mono budget)
     "logo_tiles": 360,      # logo: sequential storage, no dedup (th*tw cells)
 }
 
