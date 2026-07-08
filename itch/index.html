@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gameboy Image Converter</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #0b0f19; /* matches the app's dark theme */
+  }
+  .stage {
+    position: relative;
+    width: 100%;
+    height: 100%;
+  }
+  iframe {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    border: 0;
+  }
+  /* Loading state sits behind the iframe; visible until the app paints. */
+  .loading {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    color: #9aa4bf;
+    font-family: system-ui, sans-serif;
+  }
+  .spinner {
+    width: 40px;
+    height: 40px;
+    border: 4px solid #2a3450;
+    border-top-color: #7ee0a3;
+    border-radius: 50%;
+    animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .loading a { color: #7ee0a3; }
+</style>
+</head>
+<body>
+  <div class="stage">
+    <div class="loading">
+      <div class="spinner"></div>
+      <div>Loading Gameboy Image Converter&hellip;</div>
+      <div>Not loading? <a href="https://gameboy.prodigle.dev" target="_blank" rel="noopener">Open it in a new tab</a>.</div>
+    </div>
+    <iframe src="https://gameboy.prodigle.dev/" title="Gameboy Image Converter"
+            allow="clipboard-write; fullscreen"></iframe>
+  </div>
+</body>
+</html>
