@@ -257,11 +257,17 @@ def quantize_working_set(
 ) -> Image.Image:
     """Reduce an image to a bounded working set of RGB555-snapped colors.
 
-    Uses PIL's quantizer (libimagequant when available, MEDIANCUT fallback)
-    with dithering disabled, then snaps the result to RGB555. When
-    ``custom_palette`` is given, every pixel is mapped to the nearest color in
-    that (snapped) set instead. Returns an RGB-mode image whose pixels contain
-    only working-set colors.
+    Uses PIL's MEDIANCUT quantizer with dithering disabled, then snaps the
+    result to RGB555. When ``custom_palette`` is given, every pixel is mapped
+    to the nearest color in that (snapped) set instead. Returns an RGB-mode
+    image whose pixels contain only working-set colors.
+
+    Deliberately NOT libimagequant: the production image's Pillow build has it
+    and its quantizer collapses LANCZOS-downscaled flat art (dominant flat
+    background + soft-edged shapes) to a single out-of-gamut color, while dev
+    wheels lack the feature entirely -- so MEDIANCUT is both the correct and
+    the only validated path (all goldens/conformance values were measured on
+    it). See test_quantize_working_set_flat_art_never_collapses.
     """
     image = image.convert("RGB")
 
@@ -278,18 +284,11 @@ def quantize_working_set(
         return Image.fromarray(mapped.astype(np.uint8), "RGB")
 
     colors = max(int(max_colors), 1)
-    try:
-        quant = image.quantize(
-            colors=colors,
-            method=Image.Quantize.LIBIMAGEQUANT,
-            dither=Image.Dither.NONE,
-        )
-    except (ValueError, OSError):
-        quant = image.quantize(
-            colors=colors,
-            method=Image.Quantize.MEDIANCUT,
-            dither=Image.Dither.NONE,
-        )
+    quant = image.quantize(
+        colors=colors,
+        method=Image.Quantize.MEDIANCUT,
+        dither=Image.Dither.NONE,
+    )
     rgb = np.asarray(quant.convert("RGB"), dtype=np.uint8)
     snapped = snap_rgb555(rgb)
     return Image.fromarray(snapped, "RGB")

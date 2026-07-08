@@ -100,6 +100,32 @@ def test_quantize_working_set_bounds_and_snaps():
     assert np.array_equal(snap_rgb555(colors), colors)
 
 
+def test_quantize_working_set_flat_art_never_collapses():
+    """Regression: LANCZOS-downscaled flat art (dominant background + a few
+    soft-edged shapes) must keep a real working set. Pillow's LIBIMAGEQUANT
+    quantizer (present in the production docker image, absent in dev wheels)
+    collapsed exactly this input class to a single out-of-gamut color, turning
+    every GB Studio color conversion into a flat green screen. The quantizer
+    must stay on MEDIANCUT -- the path every golden/conformance value was
+    validated on."""
+    from PIL import ImageDraw
+
+    img = Image.new("RGB", (380, 870), (250, 248, 246))
+    d = ImageDraw.Draw(img)
+    d.ellipse([60, 150, 320, 600], fill=(214, 160, 155))
+    d.polygon([(40, 80), (360, 80), (330, 420), (70, 420)], fill=(120, 70, 75))
+    small = img.resize((160, 144), Image.LANCZOS)
+
+    out = quantize_working_set(small, 128)
+    colors = np.unique(np.asarray(out).reshape(-1, 3), axis=0)
+    assert len(colors) >= 8  # a collapse to 1 color is the failure mode
+    # The working set must stay inside the source gamut (no invented hues):
+    # every output color's channels within the source min/max envelope.
+    src = np.asarray(small).reshape(-1, 3).astype(int)
+    lo, hi = src.min(axis=0) - 8, src.max(axis=0) + 8
+    assert (colors >= lo).all() and (colors <= hi).all()
+
+
 def test_quantize_working_set_custom_palette_restricts_colors():
     custom = np.array([[255, 0, 0], [0, 255, 0], [0, 0, 255]], dtype=np.uint8)
     src = np.random.RandomState(1).randint(0, 256, size=(16, 16, 3)).astype(np.uint8)
