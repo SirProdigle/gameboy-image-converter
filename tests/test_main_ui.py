@@ -313,3 +313,61 @@ def test_hardware_notice_shows_gbstudio_import_counts():
     assert "GB Studio" in notice
     assert "247" in notice and "10" in notice
     assert "39" in notice  # recolored tiles surfaced
+
+
+def test_hardware_notice_shows_adapted_for_import_when_recolored():
+    """When we've conformed the output ourselves (gbstudio_recolored_tiles > 0),
+    the notice says tiles were adapted for import instead of warning about
+    GB Studio recoloring -- corruption is 0 by construction in this case."""
+    import types
+    import main
+    result = types.SimpleNamespace(
+        stats={
+            "tiles_used": 360, "tile_budget": 384, "palettes_used": 7,
+            "n_merges": 0, "gbstudio_tiles": 360,
+            "gbstudio_palettes_extracted": 8, "gbstudio_corrupted_tiles": 0,
+            "gbstudio_recolored_tiles": 5,
+        },
+        warnings=[],
+    )
+    notice = main._format_hardware_notice(result)
+    assert "5 tiles adapted for import" in notice
+    assert "⚠️" not in notice
+
+
+def test_hardware_notice_unchanged_when_no_tiles_recolored():
+    """gbstudio_recolored_tiles == 0 (or absent) leaves the GB Studio line
+    exactly as it was before this stat existed."""
+    import types
+    import main
+    result = types.SimpleNamespace(
+        stats={
+            "tiles_used": 360, "tile_budget": 384, "palettes_used": 7,
+            "n_merges": 0, "gbstudio_tiles": 360,
+            "gbstudio_palettes_extracted": 8, "gbstudio_corrupted_tiles": 0,
+            "gbstudio_recolored_tiles": 0,
+        },
+        warnings=[],
+    )
+    notice = main._format_hardware_notice(result)
+    assert "adapted for import" not in notice
+    assert "⚠️" not in notice
+
+
+def test_hardware_notice_safety_net_still_warns_on_corruption():
+    """If the fallback ladder is somehow exhausted and corrupted tiles remain,
+    the old honest ⚠️ warning still fires instead of crashing or hiding it."""
+    import types
+    import main
+    result = types.SimpleNamespace(
+        stats={
+            "tiles_used": 360, "tile_budget": 384, "palettes_used": 7,
+            "n_merges": 0, "gbstudio_tiles": 360,
+            "gbstudio_palettes_extracted": 10, "gbstudio_corrupted_tiles": 12,
+            "gbstudio_recolored_tiles": 0,
+        },
+        warnings=[],
+    )
+    notice = main._format_hardware_notice(result)
+    assert "⚠️ 12 tiles recolored" in notice
+    assert "adapted for import" not in notice

@@ -534,8 +534,11 @@ def _format_hardware_notice(result: "gb_pipeline.ConversionResult") -> str:
             f"GB Studio import: {stats['gbstudio_tiles']} tiles · "
             f"{stats['gbstudio_palettes_extracted']} palettes"
         )
+        recolored = stats.get("gbstudio_recolored_tiles", 0)
         corrupted = stats.get("gbstudio_corrupted_tiles", 0)
-        if corrupted:
+        if recolored:
+            gb_line += f" · {recolored} tiles adapted for import"
+        elif corrupted:
             gb_line += f" · ⚠️ {corrupted} tiles recolored"
         notice += "\n" + gb_line
     if result.warnings:
