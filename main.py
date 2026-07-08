@@ -855,6 +855,15 @@ def on_mode_change_lock_logo_size(mode):
     return gr.update(), gr.update(), gr.update()
 
 
+def on_mode_change_reference_label(mode):
+    """Relabel the right output pane per mode: hardware modes show the render
+    BEFORE GB-import fitting (tile merge + palette adaptation) as a reference,
+    while Artistic keeps its original natural-palette meaning."""
+    if mode == MODE_ARTISTIC:
+        return gr.update(label="Output Image (Natural Palette)")
+    return gr.update(label="Reference (before hardware fit)")
+
+
 def on_mode_change_custom_palette(mode):
     """Entering GB Studio: Color unticks the custom palette by default: the
     bundled gb_palette.png is a 4-color DMG ramp, which would clamp a 28-32
@@ -1018,6 +1027,11 @@ def create_gradio_interface():
 
         use_custom_palette.change(lambda x: gr.update(visible=x),
                                   inputs=[use_custom_palette], outputs=[palette_image])
+
+        # Wired here (not in mode_change_outputs) because the pane is created
+        # after that outputs list is built.
+        mode_radio.change(fn=on_mode_change_reference_label, inputs=[mode_radio],
+                          outputs=[image_output_no_palette])
 
         shared_inputs = [
             new_width, new_height, keep_aspect_ratio,

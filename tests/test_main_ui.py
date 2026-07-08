@@ -418,3 +418,14 @@ def test_limit_colors_retries_mediancut_on_flat_collapse(monkeypatch):
     colors = np.unique(np.asarray(out.convert("RGB")).reshape(-1, 3), axis=0)
     assert len(colors) > 1
     assert [66, 115, 74] not in colors.tolist()
+
+
+def test_on_mode_change_reference_label():
+    """The right pane is the converter's unconstrained render: in hardware
+    modes it shows the image BEFORE GB-import fitting (tile merge + palette
+    adaptation), so its label must say so; Artistic keeps the original name."""
+    upd = main.on_mode_change_reference_label(main.MODE_ARTISTIC)
+    assert upd["label"] == "Output Image (Natural Palette)"
+    for mode in (main.MODE_COLOR, main.MODE_MONO, main.MODE_LOGO):
+        upd = main.on_mode_change_reference_label(mode)
+        assert upd["label"] == "Reference (before hardware fit)"
