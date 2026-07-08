@@ -13,6 +13,8 @@ RUN apt-get install -y build-essential libimagequant-dev libjpeg-dev zlib1g-dev 
 # Copy local files
 COPY requirements.txt ./
 COPY main.py ./
+COPY gb_pipeline.py ./
+COPY gb_studio_import.py ./
 COPY monitoring.py ./
 COPY gb_palette.png ./
 RUN pip install --no-cache-dir -r requirements.txt
