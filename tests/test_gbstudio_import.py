@@ -204,3 +204,132 @@ def test_mono_ramp_green_buckets_detects_collision():
     buckets = gsi.mono_ramp_green_buckets(ramp)
     assert len(set(buckets)) < 4
     assert buckets[1] == buckets[2] == 1
+
+
+# -- recolor_overflow: best-fit palette-overflow recoloring --------------------
+
+
+def _tile_from_colors(cols):
+    """8x8x3 RGB tile filled row-major cycling through ``cols`` so all colors
+    are present (a distinct per-tile palette)."""
+    tile = np.zeros((8, 8, 3), dtype=np.uint8)
+    for i in range(64):
+        tile[i // 8, i % 8] = cols[i % len(cols)]
+    return tile
+
+
+def _overflow_best_fit_image():
+    """Nine mutually non-mergeable 4-color tiles laid out row-major on a 3x3
+    grid so GB extracts 9 palettes (>8). The 9th tile (scan index 8, wrapped to
+    slot 0) is a near-copy of the 6th master (slot 5) -- so best-fit recoloring
+    picks slot 5 (tiny error) where GB's ``% 8`` wrap picks slot 0 (huge error).
+    Unlike ``overflow_palettes.png`` (whose overflow tiles wrap onto their own
+    exact twins, making best-fit == %8), this exercises strict improvement."""
+    tiles = []
+    for k in range(8):
+        base = 20 + 25 * k
+        tiles.append(_tile_from_colors(
+            [(base, 0, 0), (base + 2, 0, 0), (base + 4, 0, 0), (base + 6, 0, 0)]
+        ))
+    b5 = 20 + 25 * 5  # near master slot 5, but green=1 keeps it a distinct palette
+    tiles.append(_tile_from_colors(
+        [(b5, 1, 0), (b5 + 2, 1, 0), (b5 + 4, 1, 0), (b5 + 6, 1, 0)]
+    ))
+    rows = [np.concatenate(tiles[r * 3:r * 3 + 3], axis=1) for r in range(3)]
+    return np.concatenate(rows, axis=0)
+
+
+def _total_abs_error(a, b):
+    return int(np.abs(a.astype(int) - b.astype(int)).sum())
+
+
+def _mod8_reconstruction(arr):
+    """GB Studio's own ``% 8``-wrapped reconstruction of ``arr``, built from the
+    public ``autopalette`` output (filled palettes + wrapped per-tile map +
+    per-pixel nearest-color indices)."""
+    indexed, palettes, tile_map = gsi.autopalette(arr)
+    h, w = arr.shape[:2]
+    xt, yt = w // 8, h // 8
+    out = np.zeros_like(arr)
+    for ty in range(yt):
+        for tx in range(xt):
+            pal = palettes[tile_map[ty * xt + tx]]
+            for y in range(8):
+                for x in range(8):
+                    slot = int(indexed[ty * 8 + y, tx * 8 + x])
+                    out[ty * 8 + y, tx * 8 + x] = gsi._rgb_of(pal[slot])
+    return out
+
+
+def test_recolor_overflow_recolors_only_overflow_tiles():
+    """On the 12-palette overflow fixture, exactly the 4 tiles GB pushes past
+    slot 8 are recolored; every tile that maps to a kept master (< 8) is copied
+    through byte-identical, and the input array is never mutated."""
+    arr = _load("overflow_palettes.png")
+    original = arr.copy()
+    new_arr, n = gsi.recolor_overflow(arr)
+
+    assert n == 4
+    assert np.array_equal(arr, original)  # pure: input untouched
+
+    h, w = arr.shape[:2]
+    xt, yt = w // 8, h // 8
+    changed = 0
+    for ty in range(yt):
+        for tx in range(xt):
+            a = arr[ty * 8:ty * 8 + 8, tx * 8:tx * 8 + 8]
+            b = new_arr[ty * 8:ty * 8 + 8, tx * 8:tx * 8 + 8]
+            if np.array_equal(a, b):
+                continue
+            changed += 1
+    assert changed == 4  # only the overflow tiles differ
+
+
+def test_recolor_overflow_reaches_gbstudio_clean_fixed_point():
+    """Iterating recolor_overflow + gbstudio_color_stats converges to a GB-legal
+    import (<= 8 palettes, 0 corrupted tiles) within 4 passes on the fixture."""
+    arr = _load("overflow_palettes.png")
+    cur = arr
+    reached = False
+    for _ in range(4):
+        s = gsi.gbstudio_color_stats(cur)
+        if s.palettes_extracted <= 8 and s.corrupted_tiles == 0:
+            reached = True
+            break
+        cur, _ = gsi.recolor_overflow(cur)
+    assert reached
+    final = gsi.gbstudio_color_stats(cur)
+    assert final.palettes_extracted <= 8
+    assert final.corrupted_tiles == 0
+
+
+def test_recolor_overflow_never_worse_than_mod8_wrap():
+    """Best-fit recoloring's total pixel error vs the original is <= GB Studio's
+    own ``% 8`` reconstruction error. On overflow_palettes.png the overflow tiles
+    wrap onto their exact twins, so the two are equal (the guarantee is <=)."""
+    arr = _load("overflow_palettes.png")
+    new_arr, _ = gsi.recolor_overflow(arr)
+    best_err = _total_abs_error(new_arr, arr)
+    mod8_err = _total_abs_error(_mod8_reconstruction(arr), arr)
+    assert best_err <= mod8_err
+
+
+def test_recolor_overflow_beats_mod8_wrap_when_wrap_is_suboptimal():
+    """When an overflow tile's ``% 8`` slot is NOT its best-fit master, best-fit
+    recoloring is strictly lower total error than GB's blind wrap."""
+    arr = _overflow_best_fit_image()
+    assert gsi.gbstudio_color_stats(arr).palettes_extracted == 9  # overflow present
+    new_arr, n = gsi.recolor_overflow(arr)
+    assert n == 1
+    best_err = _total_abs_error(new_arr, arr)
+    mod8_err = _total_abs_error(_mod8_reconstruction(arr), arr)
+    assert best_err < mod8_err
+
+
+def test_recolor_overflow_noop_when_within_eight_palettes():
+    """An image GB imports cleanly (<= 8 palettes) is returned unchanged with a
+    zero recolor count."""
+    arr = _tile_from_colors([(10, 0, 0), (20, 0, 0), (30, 0, 0), (40, 0, 0)])
+    new_arr, n = gsi.recolor_overflow(arr)
+    assert n == 0
+    assert np.array_equal(new_arr, arr)

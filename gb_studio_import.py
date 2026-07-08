@@ -83,15 +83,16 @@ def _unique_keep_order(seq):
     return out
 
 
-def _greedy_compress(palettes: list):
-    """compressPalettes: greedily merge any two palettes whose color union is
-    <=4 (repeatedly, first compatible pair wins), then build the original->new
-    mapping table with the overflow wrapped ``% 8``.
+def _greedy_compress_groups(palettes: list):
+    """compressPalettes' merge phase: greedily merge any two palettes whose color
+    union is <=4 (repeatedly, first compatible pair wins).
 
-    Returns ``(out_palettes, mapping_table)`` where ``out_palettes`` is the list
-    of merged variable-length hex palettes (NOT yet filled to 4) and
-    ``mapping_table[original_index] = new_index % 8``. ``len(out_palettes) > 8``
-    is exactly GB Studio's silent-corruption condition.
+    Returns ``(out_palettes, origins)`` where ``out_palettes`` is the list of
+    merged variable-length hex palettes (NOT yet filled to 4) in their *un-wrapped*
+    merged order, and ``origins[new_index]`` lists the original palette indices
+    that collapsed into it. ``len(out_palettes) > 8`` is exactly GB Studio's
+    silent-corruption condition, and ``new_index >= 8`` marks a palette GB drops
+    (wraps ``% 8``) rather than keeps.
     """
     out = [list(p) for p in palettes]
     origins = [[i] for i in range(len(palettes))]
@@ -111,7 +112,17 @@ def _greedy_compress(palettes: list):
                     break
             if merged:
                 break
+    return out, origins
 
+
+def _greedy_compress(palettes: list):
+    """compressPalettes: greedy-merge (``_greedy_compress_groups``) then build the
+    original->new mapping table with the overflow wrapped ``% 8``.
+
+    Returns ``(out_palettes, mapping_table)`` where ``mapping_table[original_index]
+    = new_index % 8``.
+    """
+    out, origins = _greedy_compress_groups(palettes)
     mapping = [i % 8 for i in range(len(palettes))]
     for new_index, group in enumerate(origins):
         for origin in group:
@@ -214,15 +225,11 @@ def _closest_index(hexstr: str, palette: list) -> int:
     return palette.index(best_hex)
 
 
-def autopalette(arr: np.ndarray):
-    """autoPalette (colorCorrection='none', no UI palette): extract per-tile
-    palettes, compress, then index every pixel to its tile-palette slot.
-
-    Returns ``(indexed, palettes, tile_palette_map)`` where ``indexed`` is an
-    (H, W) uint8 slot-index image, ``palettes`` the list of filled 4-hex
-    palettes GB Studio derived (``len`` may exceed 8), and ``tile_palette_map``
-    the per-tile palette index (already wrapped ``% 8``)."""
-    arr = np.asarray(arr, dtype=np.uint8)
+def _extract_tile_palettes(arr: np.ndarray):
+    """autoPalette's first half: extract each tile's <=4-color palette and dedup
+    identical palettes into a global list. Returns ``(all_palettes, tile_map,
+    (h, w, xt, yt))`` where ``tile_map[ti]`` indexes into ``all_palettes``
+    (BEFORE compression)."""
     h, w = arr.shape[:2]
     xt, yt = w // 8, h // 8
 
@@ -246,6 +253,19 @@ def autopalette(arr: np.ndarray):
                 tile_map[ti] = len(all_palettes)
                 palette_cache[key] = tile_map[ti]
                 all_palettes.append(palette)
+    return all_palettes, tile_map, (h, w, xt, yt)
+
+
+def autopalette(arr: np.ndarray):
+    """autoPalette (colorCorrection='none', no UI palette): extract per-tile
+    palettes, compress, then index every pixel to its tile-palette slot.
+
+    Returns ``(indexed, palettes, tile_palette_map)`` where ``indexed`` is an
+    (H, W) uint8 slot-index image, ``palettes`` the list of filled 4-hex
+    palettes GB Studio derived (``len`` may exceed 8), and ``tile_palette_map``
+    the per-tile palette index (already wrapped ``% 8``)."""
+    arr = np.asarray(arr, dtype=np.uint8)
+    all_palettes, tile_map, (h, w, xt, yt) = _extract_tile_palettes(arr)
 
     palettes, mapping = compress_palettes(all_palettes)
 
@@ -266,6 +286,75 @@ def autopalette(arr: np.ndarray):
                         idx_cache[ck] = slot
                     indexed[ty * 8 + y, tx * 8 + x] = slot
     return indexed, palettes, tile_map
+
+
+def _tile_reconstruction_error(tile_rgb: np.ndarray, palette: list) -> int:
+    """Total per-pixel Manhattan-RGB error of reconstructing an 8x8 tile under
+    GB Studio's own nearest-color rule (``_closest_index``) against a filled
+    4-slot ``palette`` -- i.e. how badly that palette would recolor the tile."""
+    total = 0
+    cache = {}
+    for y in range(8):
+        for x in range(8):
+            r, g, b = (int(v) for v in tile_rgb[y, x])
+            ck = (r, g, b)
+            err = cache.get(ck)
+            if err is None:
+                pr, pg, pb = _rgb_of(palette[_closest_index(_hex(r, g, b), palette)])
+                err = abs(r - pr) + abs(g - pg) + abs(b - pb)
+                cache[ck] = err
+            total += err
+    return total
+
+
+def recolor_overflow(arr: np.ndarray):
+    """Pre-empt GB Studio's silent ``% 8`` palette-overflow corruption by
+    recoloring the offending tiles ourselves, with a best-fit palette choice.
+
+    Runs GB's autoPalette machinery and inspects the *un-wrapped* greedy-merge
+    result. Tiles whose merged palette index is < 8 land on a palette GB keeps,
+    so they import faithfully and are copied through untouched. Tiles whose
+    merged index is >= 8 are the ones GB would wrap ``% 8`` (arbitrary, lossy):
+    each is rewritten as GB's own reconstruction (nearest-color, Manhattan RGB)
+    against the kept palette (index < 8) that minimizes the tile's total
+    reconstruction error -- the best fit, not GB's blind wrap.
+
+    Pure: does not mutate ``arr``. Returns ``(new_arr, n_recolored)``."""
+    arr = np.asarray(arr, dtype=np.uint8)
+    all_palettes, tile_map, (h, w, xt, yt) = _extract_tile_palettes(arr)
+    out, origins = _greedy_compress_groups(all_palettes)
+
+    # Un-wrapped merged index per original palette: GB's greedy result BEFORE the
+    # corrupting ``% 8`` wrap, so we can tell keepers (< 8) from overflow (>= 8).
+    unwrapped = [0] * len(all_palettes)
+    for new_index, group in enumerate(origins):
+        for origin in group:
+            unwrapped[origin] = new_index
+    filled = [fill_variable_palette(_sort_hex_palette(p)) for p in out]
+    kept = filled[:8]  # the 8 palettes GB actually keeps
+
+    new_arr = arr.copy()
+    n_recolored = 0
+    for ty in range(yt):
+        for tx in range(xt):
+            ti = ty * xt + tx
+            if unwrapped[tile_map[ti]] < 8:
+                continue  # maps to a kept master -> GB imports it faithfully
+            block = arr[ty * 8:ty * 8 + 8, tx * 8:tx * 8 + 8]
+            best_pal = kept[0]
+            best_err = None
+            for pal in kept:
+                err = _tile_reconstruction_error(block, pal)
+                if best_err is None or err < best_err:
+                    best_err = err
+                    best_pal = pal
+            for y in range(8):
+                for x in range(8):
+                    r, g, b = (int(v) for v in block[y, x])
+                    slot = _closest_index(_hex(r, g, b), best_pal)
+                    new_arr[ty * 8 + y, tx * 8 + x] = _rgb_of(best_pal[slot])
+            n_recolored += 1
+    return new_arr, n_recolored
 
 
 def _flip_tile(tile, fx, fy):
