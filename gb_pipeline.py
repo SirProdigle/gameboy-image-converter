@@ -294,6 +294,66 @@ def quantize_working_set(
     return Image.fromarray(snapped, "RGB")
 
 
+def count_palette_colors(palettes: np.ndarray) -> int:
+    """Number of distinct colors across all of a (p, 4, 3) palette stack."""
+    pals = np.asarray(palettes, dtype=np.uint8).reshape(-1, 3)
+    return int(np.unique(pals, axis=0).shape[0])
+
+
+def cap_palette_colors(
+    palettes: np.ndarray,
+    image: np.ndarray,
+    max_colors: int,
+    allow_new_colors: bool = True,
+) -> np.ndarray:
+    """Reduce a (p, 4, 3) palette stack to <= ``max_colors`` distinct colors.
+
+    ``palettes`` holds up to ``4 * p`` distinct colors; a color budget that is
+    not a whole number of palettes (e.g. 9 of 12 slots) needs the surplus
+    colors folded together. Repeatedly merges the pair of distinct colors with
+    the smallest Ward cost (``w_a * w_b / (w_a + w_b) * dE^2`` in CIELAB, where
+    a color's weight is how many ``image`` pixels are nearest to it), replacing
+    both everywhere with their weighted centroid (RGB555-snapped), or -- when
+    ``allow_new_colors`` is False, e.g. a custom palette restricts the output
+    set -- with whichever of the two carries more pixels. Palettes stay
+    luminance-sorted; duplicate entries within a palette are legal (that is
+    what a <4-color palette already looks like).
+    """
+    pals = np.asarray(palettes, dtype=np.uint8).copy()
+    max_colors = max(1, int(max_colors))
+    if count_palette_colors(pals) <= max_colors:
+        return pals
+
+    arr = np.asarray(image, dtype=np.uint8).reshape(-1, 3)
+    px, px_counts = np.unique(arr, axis=0, return_counts=True)
+    px_lab = _rgb_to_lab(px)
+    px_counts = px_counts.astype(np.float64)
+
+    while True:
+        uniq = np.unique(pals.reshape(-1, 3), axis=0)
+        n = len(uniq)
+        if n <= max_colors:
+            break
+        lab = _rgb_to_lab(uniq)
+        w = np.bincount(
+            _nearest_indices(px_lab, lab), weights=px_counts, minlength=n
+        ) + 1e-6
+        diff = lab[:, None, :] - lab[None, :, :]
+        d2 = np.sum(diff * diff, axis=2)
+        cost = d2 * (w[:, None] * w[None, :]) / (w[:, None] + w[None, :])
+        np.fill_diagonal(cost, np.inf)
+        a, b = np.unravel_index(int(np.argmin(cost)), cost.shape)
+        if allow_new_colors:
+            centroid = (lab[a] * w[a] + lab[b] * w[b]) / (w[a] + w[b])
+            new = snap_rgb555(_lab_to_rgb_u8(centroid[None, :]))[0]
+        else:
+            new = uniq[a] if w[a] >= w[b] else uniq[b]
+        for old in (uniq[a], uniq[b]):
+            pals[np.all(pals == old, axis=2)] = new
+
+    return np.stack([luminance_sort(p) for p in pals]).astype(np.uint8)
+
+
 def pack_palettes_mono(image: np.ndarray, ramp: np.ndarray) -> tuple:
     """Mono packing: one fixed 4-shade ramp, every cell assigned to it.
 
@@ -1598,6 +1658,7 @@ def convert_for_hardware(
     dither: str = "none",
     custom_palette: np.ndarray | None = None,
     mono_ramp: np.ndarray | None = None,
+    max_colors: int | None = None,
 ) -> ConversionResult:
     """Convert ``image`` to a GB Studio-importable render for a named preset.
 
@@ -1607,7 +1668,13 @@ def convert_for_hardware(
     the ramp path), losslessly dedup (skipped for logo), lossily merge to the
     tile budget (skipped for logo / no budget), then verify and render.
     ``reserve_ui_palette`` reserves palette 8 for the dialogue/UI palette by
-    reducing an 8-palette color preset to 7. Returns a ConversionResult with
+    reducing an 8-palette color preset to 7. ``max_colors`` (color presets
+    only; ignored for mono) is a target for the total distinct colors across
+    all palettes: it is clamped to the hardware ceiling (32, or 28 with the UI
+    palette reserved -- with a warning), the palette count becomes
+    ``ceil(max_colors / 4)``, and a budget that is not a whole number of
+    palettes is enforced by folding the surplus colors together. ``None``
+    means "use everything the hardware allows". Returns a ConversionResult with
     the final and pre-merge reference images, verified stats, warnings, and
     per-palette hex swatches.
     """
@@ -1645,14 +1712,43 @@ def convert_for_hardware(
     if reserve_ui_palette and not ps.mono and n_palettes >= 8:
         n_palettes -= 1
 
+    # Color budget (color presets): the hardware ceiling is 4 colors per
+    # palette; a smaller requested total shrinks the palette count to
+    # ceil(N / 4) and caps the distinct colors across them at N.
+    hw_max_colors = 4 * n_palettes
+    color_cap = None  # None => no extra cap beyond whole palettes
+    if ps.mono:
+        target_colors = None
+    elif max_colors is None:
+        target_colors = hw_max_colors
+    else:
+        target_colors = max(1, int(max_colors))
+        if target_colors > hw_max_colors:
+            if reserve_ui_palette and ps.n_palettes >= 8 and target_colors <= 4 * ps.n_palettes:
+                warnings.append(
+                    f"Requested {target_colors} colors but palette 8 is reserved "
+                    f"for dialogue/UI, so output is capped at {hw_max_colors} "
+                    "(untick the reserve option to use all 32)."
+                )
+            else:
+                warnings.append(
+                    f"Requested {target_colors} colors exceeds this preset's "
+                    f"hardware limit; capped at {hw_max_colors} "
+                    f"({n_palettes} palettes x 4)."
+                )
+            target_colors = hw_max_colors
+        n_palettes = max(1, -(-target_colors // 4))
+        if target_colors < 4 * n_palettes:
+            color_cap = target_colors
+
     if custom_palette is not None and not ps.mono:
         k = int(np.unique(
             snap_rgb555(np.asarray(custom_palette, dtype=np.uint8).reshape(-1, 3)),
             axis=0).shape[0])
-        if k < 4 * n_palettes:
+        if k < target_colors:
             warnings.append(
                 f"Custom palette restricts output to {k} colors (this preset "
-                f"supports up to {4 * n_palettes}). The right pane shows the "
+                f"supports up to {target_colors}). The right pane shows the "
                 "converter's own choices."
             )
 
@@ -1681,6 +1777,10 @@ def convert_for_hardware(
             )
             a = np.asarray(quantized, dtype=np.uint8)
             pals, assignment = pack_palettes(a, n_pal, custom_palette)
+            if color_cap is not None:
+                pals = cap_palette_colors(
+                    pals, a, color_cap, allow_new_colors=custom_palette is None
+                )
             # Palette packing runs on the quantized working set, but per-pixel
             # indexing/dithering reads the ORIGINAL pixels so nearest-entry
             # mapping and Bayer dithering see real gradients instead of the
@@ -1718,6 +1818,13 @@ def convert_for_hardware(
             "simplify the image, or disable dithering to reduce quality loss."
         )
 
+    if not ps.mono and cr.n_pal_final < n_palettes:
+        warnings.append(
+            f"Only {cr.n_pal_final} of {n_palettes} palettes could be used: "
+            "GB Studio's importer needed fewer palettes to import this image "
+            "cleanly, so the output has fewer colors than requested."
+        )
+
     if budget is not None and cr.tiles > budget:
         warnings.append(
             f"Verified tile count {cr.tiles} exceeds the {budget} budget "
@@ -1728,6 +1835,8 @@ def convert_for_hardware(
         "tiles_used": n_reimport if budget is None else int(cr.tiles),
         "tile_budget": budget,
         "palettes_used": int(final_gb.palettes.shape[0]),
+        "colors_used": count_palette_colors(final_gb.palettes),
+        "colors_target": target_colors,
         "n_merges": int(n_merges),
         "p95_delta_e": p95,
         "preset": ps.name,

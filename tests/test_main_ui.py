@@ -62,6 +62,7 @@ _HARDWARE_DEFAULTS = dict(
     hw_dither_method="None",
     tile_budget=384,
     logo_subtype="Color",
+    hw_max_colors=None,
 )
 
 
@@ -80,6 +81,7 @@ def _call_process_image(mode, image, custom_palette, **overrides):
         kwargs["irregular_size"],
         kwargs["reserve_ui_palette"], kwargs["hw_dither_method"], kwargs["tile_budget"],
         kwargs["logo_subtype"],
+        "Auto", kwargs["hw_max_colors"],
     )
 
 
@@ -175,14 +177,14 @@ def test_mono_ramp_defaults_to_gb_palette():
 
 
 def test_on_mode_or_logo_change_visibility():
-    artistic, hardware, reserve, tiles, logo, effects = main.on_mode_or_logo_change(
+    artistic, hardware, reserve, tiles, logo, effects, colors = main.on_mode_or_logo_change(
         main.MODE_ARTISTIC, "Color"
     )
     assert artistic["visible"] is True
     assert hardware["visible"] is False
     assert effects["visible"] is True
 
-    artistic, hardware, reserve, tiles, logo, effects = main.on_mode_or_logo_change(
+    artistic, hardware, reserve, tiles, logo, effects, colors = main.on_mode_or_logo_change(
         main.MODE_COLOR, "Color"
     )
     assert artistic["visible"] is False
@@ -190,21 +192,24 @@ def test_on_mode_or_logo_change_visibility():
     assert reserve["visible"] is True
     assert tiles["visible"] is True
     assert tiles["value"] == 384
+    assert colors["visible"] is True
 
-    artistic, hardware, reserve, tiles, logo, effects = main.on_mode_or_logo_change(
+    artistic, hardware, reserve, tiles, logo, effects, colors = main.on_mode_or_logo_change(
         main.MODE_MONO, "Color"
     )
     assert reserve["visible"] is False
     # Mono is always 192 tiles (DMG) -- no budget choice, so the picker hides.
     assert tiles["visible"] is False
     assert tiles["value"] == 192
+    assert colors["visible"] is False  # mono is always 4 shades
 
-    artistic, hardware, reserve, tiles, logo, effects = main.on_mode_or_logo_change(
+    artistic, hardware, reserve, tiles, logo, effects, colors = main.on_mode_or_logo_change(
         main.MODE_LOGO, "Mono"
     )
     assert logo["visible"] is True
     assert tiles["visible"] is False
     assert reserve["visible"] is False
+    assert colors["visible"] is False
 
 
 def test_on_mode_change_lock_logo_size():

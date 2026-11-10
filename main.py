@@ -487,6 +487,15 @@ HARDWARE_MODES = (MODE_COLOR, MODE_MONO, MODE_LOGO)
 
 HW_DITHER_METHODS = {"None": "none", "Bayer": "bayer"}
 
+# GBC hardware: 8 palettes x 4 colors. Palette 8 is reserved for dialogue/UI
+# by default, leaving 28 colors for the scene itself.
+GB_STUDIO_MAX_COLORS = 32
+GB_STUDIO_SCENE_COLORS = 28
+
+
+def _hw_color_ceiling(reserve_ui_palette) -> int:
+    return GB_STUDIO_SCENE_COLORS if reserve_ui_palette else GB_STUDIO_MAX_COLORS
+
 RESIZE_FILTERS = {"Nearest (pixel art)": Image.NEAREST, "Lanczos (smooth)": Image.LANCZOS}
 
 
@@ -548,7 +557,12 @@ def _format_hardware_notice(result: "gb_pipeline.ConversionResult") -> str:
         tiles_part = f"{stats['tiles_used']} tiles (no tile limit)"
     else:
         tiles_part = f"{stats['tiles_used']}/{stats['tile_budget']} tiles"
-    notice = f"✅ {tiles_part} · {stats['palettes_used']} palettes · {stats['n_merges']} merges"
+    if stats.get("colors_target") is not None:
+        colors_part = f"{stats['colors_used']}/{stats['colors_target']} colors · "
+    else:
+        colors_part = ""
+    notice = (f"✅ {tiles_part} · {colors_part}{stats['palettes_used']} palettes · "
+              f"{stats['n_merges']} merges")
     if "gbstudio_tiles" in stats:
         gb_line = (
             f"GB Studio import: {stats['gbstudio_tiles']} tiles · "
@@ -667,7 +681,11 @@ def _process_artistic(image, color_limit, num_colors, quant_method, dither_metho
     if black_and_white:
         image = convert_to_black_and_white(image, threshold=bw_threshold)
 
-    return image, text_for_palette, image_for_reference_palette, "No Warnings", palette_html
+    warning = "No Warnings"
+    if color_limit and int(num_colors) > GB_STUDIO_MAX_COLORS:
+        warning = (f"⚠️ {int(num_colors)} colors exceeds GB Studio's {GB_STUDIO_MAX_COLORS}-color "
+                   "limit (8 palettes x 4) -- fine for artistic use, but it won't import as GBC art.")
+    return image, text_for_palette, image_for_reference_palette, warning, palette_html
 
 
 def process_image(image, mode, width, height, aspect_ratio,
@@ -677,7 +695,7 @@ def process_image(image, mode, width, height, aspect_ratio,
                   enable_gothic_filter, brightness_threshold, dot_size, spacing, contrast_boost,
                   noise_factor, edge_enhance, apply_blur, irregular_shape, irregular_size,
                   reserve_ui_palette, hw_dither_method, tile_budget, logo_subtype,
-                  resize_filter="Auto"):
+                  resize_filter="Auto", hw_max_colors=None):
     """Route a single image through the Artistic flow or a GB Studio hardware
     preset, depending on `mode`. Hardware modes call
     `gb_pipeline.convert_for_hardware`; the Artistic path is untouched.
@@ -716,6 +734,7 @@ def process_image(image, mode, width, height, aspect_ratio,
         else:
             budget = int(tile_budget)
         dither_key = HW_DITHER_METHODS.get(hw_dither_method, "none")
+        max_colors = None if preset_info.mono or hw_max_colors is None else int(hw_max_colors)
 
         result = gb_pipeline.convert_for_hardware(
             image, preset,
@@ -724,6 +743,7 @@ def process_image(image, mode, width, height, aspect_ratio,
             dither=dither_key,
             custom_palette=custom_palette_arr,
             mono_ramp=mono_ramp_arr,
+            max_colors=max_colors,
         )
 
         if custom_palette_arr is not None:
@@ -736,6 +756,7 @@ def process_image(image, mode, width, height, aspect_ratio,
                 dither=dither_key,
                 custom_palette=None,
                 mono_ramp=mono_ramp_arr,
+                max_colors=max_colors,
             )
             reference_out = natural.image
         else:
@@ -754,7 +775,7 @@ def process_image_folder(input_files, mode, width, height, aspect_ratio,
                          enable_gothic_filter, brightness_threshold, dot_size, spacing, contrast_boost,
                          noise_factor, edge_enhance, apply_blur, irregular_shape, irregular_size,
                          reserve_ui_palette, hw_dither_method, tile_budget, logo_subtype,
-                         resize_filter="Auto"):
+                         resize_filter="Auto", hw_max_colors=None):
     with task_log("process_image_folder"):
         folder_name = "output_" + str(random.randint(0, 100000))
         while os.path.exists(folder_name):
@@ -774,7 +795,7 @@ def process_image_folder(input_files, mode, width, height, aspect_ratio,
                     enable_gothic_filter, brightness_threshold, dot_size, spacing, contrast_boost,
                     noise_factor, edge_enhance, apply_blur, irregular_shape, irregular_size,
                     reserve_ui_palette, hw_dither_method, tile_budget, logo_subtype,
-                    resize_filter,
+                    resize_filter, hw_max_colors,
                 )
                 base_name = os.path.basename(input_files[index].name)
                 result[0].save(os.path.join(folder_name, base_name))
@@ -845,7 +866,18 @@ def on_mode_or_logo_change(mode, logo_subtype):
         gr.update(visible=tiles_visible, value=tile_budget_value),  # tile_budget_number
         gr.update(visible=is_logo),                                # logo_subtype_radio
         gr.update(visible=is_artistic),                            # effects_accordion
+        gr.update(visible=reserve_visible),                        # hw_color_slider (color/logo-color only)
     )
+
+
+def on_reserve_change_color_ceiling(reserve_ui_palette, current):
+    """Palette 8 reserved -> the color budget tops out at 28, else 32.
+    A slider sitting at the old maximum follows the new one; anything lower
+    is only clamped if it no longer fits."""
+    new_max = _hw_color_ceiling(reserve_ui_palette)
+    old_max = GB_STUDIO_MAX_COLORS if reserve_ui_palette else GB_STUDIO_SCENE_COLORS
+    value = new_max if current is None or int(current) >= old_max else min(int(current), new_max)
+    return gr.update(maximum=new_max, value=value)
 
 
 def on_mode_change_lock_logo_size(mode):
@@ -921,6 +953,11 @@ def create_gradio_interface():
                             label="Reserve palette 8 for dialogue/UI", value=True)
                         hw_dither_method = gr.Dropdown(choices=list(HW_DITHER_METHODS.keys()),
                                                        label="Dither Method", value="None")
+                    hw_color_slider = gr.Slider(
+                        label="Colour budget (total colours across all palettes; 4 per palette)",
+                        info="e.g. 12 = 3 palettes. 28 max with palette 8 reserved, 32 without.",
+                        minimum=2, maximum=GB_STUDIO_SCENE_COLORS, step=1,
+                        value=GB_STUDIO_SCENE_COLORS, visible=False)
                     tile_budget_number = gr.Radio(
                         choices=[("Colour + Mono (192)", 192), ("Colour Only (384)", 384)],
                         value=384,
@@ -986,11 +1023,16 @@ def create_gradio_interface():
                 )
 
                 mode_change_outputs = [artistic_panel, hardware_panel, reserve_ui_palette_checkbox,
-                                       tile_budget_number, logo_subtype_radio, effects_accordion]
+                                       tile_budget_number, logo_subtype_radio, effects_accordion,
+                                       hw_color_slider]
                 mode_radio.change(fn=on_mode_or_logo_change, inputs=[mode_radio, logo_subtype_radio],
                                   outputs=mode_change_outputs)
                 logo_subtype_radio.change(fn=on_mode_or_logo_change, inputs=[mode_radio, logo_subtype_radio],
                                          outputs=mode_change_outputs)
+                reserve_ui_palette_checkbox.change(
+                    fn=on_reserve_change_color_ceiling,
+                    inputs=[reserve_ui_palette_checkbox, hw_color_slider],
+                    outputs=[hw_color_slider])
                 mode_radio.change(fn=on_mode_change_lock_logo_size, inputs=[mode_radio],
                                   outputs=[keep_aspect_ratio, new_width, new_height])
                 mode_radio.change(fn=on_mode_change_custom_palette, inputs=[mode_radio],
@@ -1041,7 +1083,7 @@ def create_gradio_interface():
             enable_gothic_filter, brightness_threshold, dot_size, spacing, contrast_boost,
             noise_factor, edge_enhance, apply_blur, irregular_shape, irregular_size,
             reserve_ui_palette_checkbox, hw_dither_method, tile_budget_number, logo_subtype_radio,
-            resize_filter_dropdown,
+            resize_filter_dropdown, hw_color_slider,
         ]
 
         execute_button.click(run_in_task_executor(process_image),
